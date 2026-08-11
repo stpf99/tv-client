@@ -36,14 +36,15 @@ class TvhLibrary(GObject.GObject):
         "connect-failed": (GObject.SignalFlags.RUN_FIRST, None, (str,)),
         "channels-changed": (GObject.SignalFlags.RUN_FIRST, None, ()),
         "tags-changed": (GObject.SignalFlags.RUN_FIRST, None, ()),
-        "epg-changed": (GObject.SignalFlags.RUN_FIRST, None, (int,)),  # channel_id
+        # channel_id bywa > 2^31 (u32) – gint nie pomieści → object
+        "epg-changed": (GObject.SignalFlags.RUN_FIRST, None, (object,)),
         "recordings-changed": (GObject.SignalFlags.RUN_FIRST, None, ()),
         "initial-sync-done": (GObject.SignalFlags.RUN_FIRST, None, ()),
         # licznik postepu podczas wstepnej synchronizacji (kanaly, zdarzenia EPG)
         "sync-progress": (GObject.SignalFlags.RUN_FIRST, None, (int, int)),
         # Rzadkie zdarzenia sterujace – nadal przez GLib (bezpieczne dla GTK)
-        "stream-started": (GObject.SignalFlags.RUN_FIRST, None, (int, object)),
-        "stream-stopped": (GObject.SignalFlags.RUN_FIRST, None, (int,)),
+        "stream-started": (GObject.SignalFlags.RUN_FIRST, None, (object, object)),
+        "stream-stopped": (GObject.SignalFlags.RUN_FIRST, None, (object,)),
         "signal-status": (GObject.SignalFlags.RUN_FIRST, None, (object,)),
     }
 
@@ -155,12 +156,16 @@ class TvhLibrary(GObject.GObject):
         # moga przyjsc przed lub po kanale, wiec probujemy od razu tutaj
         # (na wypadek gdy tag juz jest znany) - pelny re-scan i tak nastapi
         # gdy przyjdzie/zaktualizuje sie tagAdd.
+        old = self.channels.get(ch.channel_id)
         self.channels[ch.channel_id] = ch
         self._sync_channel_count += 1
         if any("radio" in self.tags[tid].name.lower() for tid in ch.tag_ids if tid in self.tags):
             ch.is_radio = True
         self._schedule_channels_changed()
         self._schedule_sync_progress()
+        # channelUpdate z nowym eventId = zmiana aktualnej audycji → odśwież EPG
+        if old is None or old.current_event_id != ch.current_event_id:
+            self._schedule_epg_changed(ch.channel_id)
 
     def _on_channel_delete(self, m: dict) -> None:
         self.channels.pop(m.get("channelId"), None)
@@ -238,7 +243,31 @@ class TvhLibrary(GObject.GObject):
                 break
         else:
             lst.append(ev)
+        # utrzymuj posortowaną listę – widok EPG i „sąsiedzi” tego wymagają
+        lst.sort(key=lambda e: e.start)
         self._sync_event_count += 1
+        # diagnostyka: pierwsze eventy – raw vs znormalizowane vs zegar systemowy
+        if self._sync_event_count <= 5:
+            import time as _t
+            from datetime import datetime as _dt
+            now = int(_t.time())
+            raw_start, raw_stop = m.get("start"), m.get("stop")
+            logger.info(
+                "EPG sample eventId=%s ch=%s raw_start=%r raw_stop=%r "
+                "→ start=%s (%s) stop=%s (%s) dur=%smin now=%s (%s) title=%r",
+                ev.event_id,
+                ch_id,
+                raw_start,
+                raw_stop,
+                ev.start,
+                _dt.fromtimestamp(ev.start).isoformat(sep=" ") if ev.start else "?",
+                ev.stop,
+                _dt.fromtimestamp(ev.stop).isoformat(sep=" ") if ev.stop else "?",
+                int((ev.stop - ev.start) / 60) if ev.start and ev.stop and ev.stop > ev.start else "?",
+                now,
+                _dt.fromtimestamp(now).isoformat(sep=" "),
+                (ev.title or "")[:40],
+            )
         self._schedule_epg_changed(ch_id)
         self._schedule_sync_progress()
 
@@ -373,10 +402,31 @@ class TvhLibrary(GObject.GObject):
         )
 
     def record_event(self, channel_id: int, event_id: int) -> None:
+        """Jednorazowe nagranie po eventId."""
         bridge.call_with_callback(
             self.client.add_dvr_entry(channel_id=channel_id, event_id=event_id),
             lambda r: logger.info("Zaplanowano nagranie: %s", r),
             lambda e: logger.error("addDvrEntry: %s", e),
+        )
+
+    def record_manual(self, channel_id: int, title: str, start: int, stop: int) -> None:
+        """Ręczne nagranie w zadanym oknie czasowym."""
+        bridge.call_with_callback(
+            self.client.add_dvr_entry(
+                channel_id=channel_id, title=title, start=start, stop=stop
+            ),
+            lambda r: logger.info("Zaplanowano ręczne nagranie: %s", r),
+            lambda e: logger.error("addDvrEntry (manual): %s", e),
+        )
+
+    def record_series(self, title: str, channel_id: Optional[int] = None, event_id: Optional[int] = None) -> None:
+        """Zaplanuj serię (autorec) po tytule / eventId."""
+        bridge.call_with_callback(
+            self.client.add_autorec_entry(
+                title=title, channel_id=channel_id, event_id=event_id
+            ),
+            lambda r: logger.info("Zaplanowano serię: %s", r),
+            lambda e: logger.error("addAutorecEntry: %s", e),
         )
 
     def cancel_recording(self, entry_id: int) -> None:
@@ -394,10 +444,54 @@ class TvhLibrary(GObject.GObject):
         )
 
     def delete_recording(self, entry_id: int) -> None:
+        """Usuń wpis i plik z serwera."""
         bridge.call_with_callback(
             self.client.delete_dvr_entry(entry_id),
             lambda r: logger.info("Usunieto nagranie %s", entry_id),
             lambda e: logger.error("deleteDvrEntry: %s", e),
+        )
+
+    def get_recording_url(
+        self,
+        entry_id: int,
+        on_ok: Callable[[str], None],
+        on_err: Optional[Callable[[Exception], None]] = None,
+    ) -> None:
+        """URL HTTP do odtwarzania / pobierania nagrania (getTicket + /dvrfile/)."""
+        from urllib.parse import quote
+
+        host = self.host or "127.0.0.1"
+        http_port = self.http_port or 9981
+        user = self.username or ""
+        password = self.password or ""
+
+        def _with_ticket(resp: dict) -> None:
+            path = (resp.get("path") or "").strip()
+            ticket = resp.get("ticket") or ""
+            if not path:
+                path = f"/dvrfile/{entry_id}"
+            if not path.startswith("/"):
+                path = "/" + path
+            qs = []
+            if ticket:
+                qs.append(f"ticket={quote(str(ticket), safe='')}")
+            query = ("?" + "&".join(qs)) if qs else ""
+            auth = ""
+            if not ticket and user:
+                auth = f"{quote(user, safe='')}:{quote(password, safe='')}@"
+            url = f"http://{auth}{host}:{http_port}{path}{query}"
+            on_ok(url)
+
+        def _fail(exc: Exception) -> None:
+            logger.warning("getTicket(dvr) failed (%s) – fallback /dvrfile/", exc)
+            path = f"/dvrfile/{entry_id}"
+            auth = f"{quote(user, safe='')}:{quote(password, safe='')}@" if user else ""
+            on_ok(f"http://{auth}{host}:{http_port}{path}")
+
+        bridge.call_with_callback(
+            self.client.get_ticket(dvr_entry_id=entry_id),
+            _with_ticket,
+            _fail if on_err is None else on_err,
         )
 
     # ------------------------------------------------------------------ #
@@ -416,8 +510,60 @@ class TvhLibrary(GObject.GObject):
         )
 
     def current_event_for_channel(self, channel_id: int, now_ts: int) -> Optional[EpgEvent]:
+        """Aktualna audycja wg pełnej daty+czasu (unix seconds == time.time()).
+
+        1) eventId z serwera – TYLKO gdy start/stop obejmują `now` (tol. 2 min)
+        2) pierwszy event z listy kanału gdzie start <= now < stop
+        3) brak → None (nie zgadujemy „ostatniego” – to dawało TERAZ w październiku)
+        """
+        TOL = 120  # 2 min na rozjazd zegarów klient/serwer
+
+        def _covers(ev: EpgEvent) -> bool:
+            if not ev or not ev.start or not ev.stop:
+                return False
+            if ev.stop <= ev.start:
+                return False
+            # absurdalna długość (>12 h) = zepsute dane EPG, odrzuć
+            if (ev.stop - ev.start) > 12 * 3600:
+                return False
+            return (ev.start - TOL) <= now_ts < (ev.stop + TOL)
+
+        ch = self.channels.get(channel_id)
+        if ch and ch.current_event_id:
+            ev = self.events.get(ch.current_event_id)
+            if ev is not None and _covers(ev):
+                return ev
+
         lst = self.events_by_channel.get(channel_id, [])
         for ev in lst:
-            if ev.start <= now_ts < ev.stop:
+            if _covers(ev):
+                return ev
+        return None
+
+    def next_event_for_channel(self, channel_id: int, now_ts: int) -> Optional[EpgEvent]:
+        """Następna audycja: nextEventId (jeśli w przyszłości) albo pierwszy start > now."""
+
+        def _sane(ev: EpgEvent) -> bool:
+            if not ev or not ev.start or not ev.stop or ev.stop <= ev.start:
+                return False
+            if (ev.stop - ev.start) > 12 * 3600:
+                return False
+            return True
+
+        ch = self.channels.get(channel_id)
+        if ch and ch.next_event_id:
+            ev = self.events.get(ch.next_event_id)
+            if ev is not None and _sane(ev) and ev.start > now_ts - 60:
+                return ev
+
+        current = self.current_event_for_channel(channel_id, now_ts)
+        lst = self.events_by_channel.get(channel_id, [])
+        if current and current.next_event_id:
+            ev = self.events.get(current.next_event_id)
+            if ev is not None and _sane(ev) and ev.start >= now_ts - 60:
+                return ev
+
+        for ev in lst:
+            if _sane(ev) and ev.start > now_ts:
                 return ev
         return None

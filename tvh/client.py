@@ -292,6 +292,29 @@ class HtspClient:
     async def delete_dvr_entry(self, entry_id: int) -> dict:
         return await self.send_and_wait("deleteDvrEntry", {"id": entry_id})
 
+    async def add_autorec_entry(
+        self,
+        title: str,
+        channel_id: Optional[int] = None,
+        event_id: Optional[int] = None,
+        fulltext: bool = False,
+        config_uuid: Optional[str] = None,
+        enabled: bool = True,
+    ) -> dict:
+        """Zaplanuj serię (autorec) po tytule / eventId."""
+        params: Dict[str, Any] = {
+            "title": title,
+            "enabled": 1 if enabled else 0,
+            "fulltext": 1 if fulltext else 0,
+        }
+        if channel_id is not None:
+            params["channelId"] = channel_id
+        if event_id is not None:
+            params["eventId"] = event_id
+        if config_uuid:
+            params["configName"] = config_uuid
+        return await self.send_and_wait("addAutorecEntry", params)
+
     async def get_ticket(self, channel_id: Optional[int] = None,
                           dvr_entry_id: Optional[int] = None) -> dict:
         params: Dict[str, Any] = {}

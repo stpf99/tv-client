@@ -37,17 +37,37 @@ HtsValue = Union[None, bool, int, float, str, bytes, dict, list]
 
 
 def _encode_s64(value: int) -> bytes:
-    """Koduje liczbę całkowitą ze znakiem do minimalnej liczby bajtów big-endian."""
+    """Koduje s64 – HTSMSG używa little-endian, bez sign-extension.
+
+    Przykład z docs: 1337 → data=[0x39, 0x05] (LE). Leading zero bytes
+    są obcinane; dla wartości ujemnych trzeba pełnych 8 bajtów 0xFF…
+    """
     if value == 0:
         return b"\x00"
-    length = (value.bit_length() // 8) + 1
-    return value.to_bytes(length, byteorder="big", signed=True)
+    # Pełne 8 bajtów LE, potem obetnij trailing zera (najwyższe bajty)
+    full = value.to_bytes(8, byteorder="little", signed=True)
+    # usuń trailing 0x00 (dla dodatnich) – zachowaj co najmniej 1 bajt
+    length = 8
+    while length > 1 and full[length - 1] == 0:
+        length -= 1
+    # dla ujemnych: docs wymagają pełnych 8×0xFF gdy trzeba znaku
+    if value < 0:
+        return full  # zawsze 8 bajtów
+    return full[:length]
 
 
 def _decode_s64(data: bytes) -> int:
+    """Dekoduje HMF_S64 (little-endian, variable length).
+
+    Docs: 1337 → [0x39, 0x05]. Brak sign-extension: krótkie sekwencje
+    z high bit są dodatnie (np. 4 bajty 0xFFFFFFFF = 2^32-1, nie -1).
+    -1 wymaga pełnych 8 bajtów 0xFF.
+    """
     if not data:
         return 0
-    return int.from_bytes(data, byteorder="big", signed=True)
+    # dopełnij do 8 bajtów zerami (brak sign-extension!)
+    padded = data + b"\x00" * (8 - len(data)) if len(data) < 8 else data[:8]
+    return int.from_bytes(padded, byteorder="little", signed=True)
 
 
 def _serialize_field(name: bytes, value: HtsValue) -> bytes:
