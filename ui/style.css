@@ -1,0 +1,135 @@
+/* Stylizacja korzysta z natywnych zmiennych libadwaita (@theme_bg_color itp.),
+   wiec automatycznie dostosowuje sie do jasnego/ciemnego motywu GNOME.
+   Akcenty OSD/kafelków nawiazuja do estetyki skorki Estuary z Kodi. */
+
+.tvh-video-area {
+  background-color: #000000;
+}
+
+/* Waska szyna nawigacji z samymi ikonami po lewej (zamiast szerokiego
+   panelu z etykietami) - stala szerokosc, nie skaluje sie z oknem */
+.tvh-rail-scroller {
+  min-width: 56px;
+}
+
+.tvh-rail-btn {
+  min-width: 44px;
+  min-height: 44px;
+  margin: 2px 0;
+  border-radius: 10px;
+}
+
+.tvh-rail-btn.tvh-rail-active {
+  background-color: alpha(@accent_bg_color, 0.22);
+  color: @accent_color;
+}
+
+/* Panel listy kanalow wysuwany JAKO NAKLADKA nad wideo, a nie stala
+   kolumna obok - w pelni wypelnia wysokosc obszaru wideo */
+.tvh-channel-overlay {
+  background-color: alpha(@window_bg_color, 0.92);
+  border-right: 1px solid alpha(@borders, 0.6);
+  box-shadow: 4px 0 16px alpha(black, 0.35);
+}
+
+.tvh-placeholder {
+  color: alpha(@theme_fg_color, 0.6);
+}
+
+/* Nakladka buforowania (start kanalu / re-buffering po zerwaniu strumienia) */
+.tvh-buffering {
+  padding: 16px 24px;
+  border-radius: 12px;
+  background-color: alpha(black, 0.55);
+  color: alpha(white, 0.9);
+}
+
+/* OSD = nakładka nad wideo (Gtk.Overlay) – nie zmienia layoutu/rozmiaru
+   obszaru wideo. Półprzezroczyste tło, czytelny tekst. */
+.tvh-osd-top,
+.tvh-osd-bottom {
+  background: linear-gradient(
+    to bottom,
+    alpha(black, 0.72),
+    alpha(black, 0.35)
+  );
+  border-radius: 14px;
+  padding: 12px 18px;
+  transition: opacity 250ms ease;
+}
+
+.tvh-osd-bottom {
+  background: linear-gradient(
+    to top,
+    alpha(black, 0.82),
+    alpha(black, 0.45) 60%,
+    alpha(black, 0.15)
+  );
+}
+
+.tvh-osd-top label,
+.tvh-osd-bottom label {
+  color: #ffffff;
+  text-shadow: 0 1px 2px alpha(black, 0.8);
+}
+
+.tvh-osd-bottom button.osd {
+  background-color: alpha(white, 0.14);
+  color: #ffffff;
+}
+
+.tvh-osd-bottom button.osd:hover {
+  background-color: alpha(white, 0.28);
+}
+
+/* Pasek postępu audycji (pozycja w programie EPG) */
+.tvh-osd-progress {
+  min-height: 6px;
+}
+
+.tvh-osd-progress trough {
+  background-color: alpha(white, 0.22);
+  border-radius: 3px;
+  min-height: 6px;
+}
+
+.tvh-osd-progress progress {
+  background-color: @accent_bg_color;
+  border-radius: 3px;
+  min-height: 6px;
+}
+
+/* Wiersze kanalow */
+.tvh-channel-row:selected {
+  background-color: alpha(@accent_bg_color, 0.18);
+}
+
+/* "Playlisty" z tagow serwera (SD/HD/Radio/...) jako male pigulki nad
+   lista kanalow */
+.tvh-tag-chip {
+  border-radius: 999px;
+  padding: 2px 12px;
+  font-size: 0.85em;
+}
+
+.tvh-tag-chip:checked {
+  background-color: @accent_bg_color;
+  color: @accent_fg_color;
+}
+
+/* Kafelki "Ostatnio odtwarzane" - jak widget Kodi na ekranie glownym */
+.tvh-recent-tile {
+  border-radius: 12px;
+  transition: transform 150ms ease;
+}
+
+.tvh-recent-tile:hover {
+  background-color: alpha(@accent_bg_color, 0.10);
+}
+
+/* Wspoldzielona belka mini-playera */
+.tvh-mini-bar {
+  border-top: 1px solid alpha(@borders, 0.6);
+  background-color: @headerbar_bg_color;
+  min-height: 34px;
+}
