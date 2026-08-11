@@ -1,0 +1,3 @@
+# Zaleznosci pip - PyGObject wymaga systemowego GTK4/libadwaita/GStreamer
+# (patrz README.md - sekcja "Zaleznosci systemowe")
+PyGObject>=3.48
