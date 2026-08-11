@@ -154,6 +154,44 @@ class StreamController(GObject.GObject):
             channel.channel_id, _start, on_err=_err, profile="pass"
         )
 
+    def play_url(self, url: str, title: str = "Nagranie") -> None:
+        """Odtwarzanie nagrania / dowolnego HTTP MPEG-TS (DVR)."""
+        self.stop()
+        self.current_channel = None
+        self._pending_subtitle_index = None
+        self._pending_subtitle_applied = True
+        with self._lock:
+            self.current_subscription_id = None
+            self._video_stream_index = None
+            self._audio_stream_index = None
+            self._subtitle_stream_index = None
+            self._all_streams = []
+            self._audio_tracks = []
+            self._subtitle_tracks = []
+
+        play_token = object()
+        self._http_play_token = play_token
+
+        safe = url
+        if "ticket=" in safe:
+            import re
+            safe = re.sub(r"ticket=[^&]+", "ticket=***", safe)
+        if "@" in safe:
+            safe = "http://***@" + safe.split("@", 1)[1]
+        logger.info("Odtwarzanie nagrania „%s” przez HTTP: %s", title, safe)
+        self.player.set_preferences(self.prefs)
+
+        from gi.repository import GLib
+
+        def _go():
+            if getattr(self, "_http_play_token", None) is not play_token:
+                return False
+            self.player.play_http_ts(url)
+            self.emit("tracks-changed")
+            return False
+
+        GLib.timeout_add(300, _go)
+
     def stop(self) -> None:
         # Najpierw unieważnij sid/indeksy – concurrent muxpkt staje się no-op
         with self._lock:
