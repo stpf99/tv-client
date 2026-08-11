@@ -90,10 +90,31 @@ class ChannelRow(Gtk.ListBoxRow):
             self.on_favorite_toggled()
 
     def refresh_program(self, library: TvhLibrary) -> None:
-        ev = library.current_event_for_channel(self.channel.channel_id, int(time.time()))
-        text = ev.title if ev else "Brak danych EPG"
+        from datetime import datetime, date
+
+        now = int(time.time())
+        ev = library.current_event_for_channel(self.channel.channel_id, now)
+        if not ev:
+            self.program_lbl.set_text("Brak danych EPG")
+            self.program_lbl.set_tooltip_text("Brak danych EPG")
+            return
+        # data + 24h gdy program nie jest „dziś” (np. poranek z jutra)
+        t0 = datetime.fromtimestamp(ev.start)
+        t1 = datetime.fromtimestamp(ev.stop)
+        today = date.fromtimestamp(now)
+        if t0.date() != today:
+            when = f"{t0.strftime('%d.%m %H:%M')}–{t1.strftime('%H:%M')}"
+        else:
+            when = f"{t0.strftime('%H:%M')}–{t1.strftime('%H:%M')}"
+        text = f"{when}  {ev.title}"
         self.program_lbl.set_text(text)
-        self.program_lbl.set_tooltip_text(text)
+        tip = (
+            f"{ev.title}\n"
+            f"{t0.strftime('%Y-%m-%d %H:%M')} – {t1.strftime('%Y-%m-%d %H:%M')}"
+        )
+        if ev.subtitle:
+            tip += f"\n{ev.subtitle}"
+        self.program_lbl.set_tooltip_text(tip)
 
 
 class ChannelListView(Gtk.Box):

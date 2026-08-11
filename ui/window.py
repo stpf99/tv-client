@@ -133,7 +133,9 @@ class MainWindow(Adw.ApplicationWindow):
         self.live_tv_view = self._build_live_page(radio=False)
         self.live_radio_view = self._build_live_page(radio=True)
         self.epg_view = EpgView(self.library)
-        self.recordings_view = RecordingsView(self.library)
+        self.recordings_view = RecordingsView(
+            self.library, on_play_url=self._play_recording_url
+        )
         self.recent_view = RecentView(self.library, self.recent_store, self._play_channel_by_id)
 
         self.content_stack.add_named(self.live_tv_view, "live_tv")
@@ -246,6 +248,14 @@ class MainWindow(Adw.ApplicationWindow):
         self.mini_channel_lbl.set_text(f"{'📻' if channel.is_radio else '📺'} {channel.name}")
         self.mini_icon.set_from_icon_name("media-playback-start-symbolic")
         self.mpris.update_now_playing(channel.name, channel.name)
+
+    def _play_recording_url(self, url: str, title: str) -> None:
+        """Odtwarzanie nagrania DVR – przełącz na TV na żywo i odtwórz URL."""
+        self._on_rail_clicked(self._rail_buttons["live_tv"], "live_tv", "TV na żywo")
+        self.stream_ctrl.play_url(url, title=title)
+        self.mini_channel_lbl.set_text(f"🎬 {title}")
+        self.mini_icon.set_from_icon_name("media-playback-start-symbolic")
+        self.mpris.update_now_playing(title, "Nagranie DVR")
 
     def _play_channel_by_id(self, channel_id: int) -> None:
         ch = self.library.channels.get(channel_id)
