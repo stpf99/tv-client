@@ -10,9 +10,6 @@ GNOME przez MPRIS2.
 
 ## Zrzuty ekranu
 
-Ścieżki względne — działają lokalnie i na GitHubie po wypchnięciu repozytorium
-(obrazy w `docs/screenshots/`).
-
 ### TV na żywo — OSD
 
 ![TV na żywo z OSD](docs/screenshots/01-live-tv-osd.png)
