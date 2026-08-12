@@ -7,6 +7,48 @@ binarnym protokołem **HTSP** (nie REST) — z osobnymi trybami *TV na żywo*,
 wspólną belką statusu (mini-player) i integracją z appletem multimediów
 GNOME przez MPRIS2.
 
+
+## Zrzuty ekranu
+
+Ścieżki względne — działają lokalnie i na GitHubie po wypchnięciu repozytorium
+(obrazy w `docs/screenshots/`).
+
+### TV na żywo — OSD
+
+![TV na żywo z OSD](docs/screenshots/01-live-tv-osd.png)
+
+### TV na żywo — lista kanałów
+
+![Lista kanałów TV](docs/screenshots/02-live-tv-channels.png)
+
+### Radio na żywo
+
+![Radio na żywo](docs/screenshots/03-live-radio.png)
+
+### Przewodnik EPG — siatka
+
+![EPG siatka](docs/screenshots/04-epg-grid.png)
+
+### Przewodnik EPG — lista
+
+![EPG lista](docs/screenshots/05-epg-list.png)
+
+### Nagrania DVR
+
+![Nagrania](docs/screenshots/06-recordings.png)
+
+### Ostatnio odtwarzane
+
+![Ostatnio odtwarzane](docs/screenshots/07-recent.png)
+
+### Połączenie z serwerem
+
+![Dialog połączenia](docs/screenshots/08-connection.png)
+
+### Preferencje odtwarzacza
+
+![Preferencje](docs/screenshots/09-preferences.png)
+
 ## Zależności systemowe (Fedora/Arch/Debian — nazwy pakietów mogą się różnić)
 
 - GTK4 (>= 4.12) + libadwaita (>= 1.5)
