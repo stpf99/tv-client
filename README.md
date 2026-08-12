@@ -41,67 +41,109 @@ Przy pierwszym uruchomieniu pojawi się okno połączenia — podaj adres
 serwera Tvheadend, port HTSP (domyślnie 9982), login/hasło. Konfiguracja
 zapisywana jest w `~/.config/tvh-gnome-client/config.json`.
 
+## Przewodnik EPG
+
+Tryb **Przewodnik EPG** oferuje trzy układy (przełącznik na pasku narzędzi):
+
+| Układ | Opis |
+|---|---|
+| **Siatka** | Gazetka jak w Kodi/STB: kanały w pionie, oś czasu w poziomie, kolorowe kafelki audycji (gatunek DVB), zamrożony nagłówek godzin i kolumna nazw, 2D scroll przez wspólne `Gtk.Adjustment`. Linia „TERAZ”, kropka PVR, nawigacja strzałkami / Enter (odtwarzaj / nagraj). |
+| **Lista** | Klasyczny widok „TERAZ + następne” per kanał z pełną datą/czasem i przyciskami PVR. |
+| **Szukaj** | Płaska lista wyników wyszukiwania parametrycznego. |
+
+### Wyszukiwanie parametryczne
+
+Filtry działają lokalnie na cache EPG z HTSP (`eventAdd` / `eventUpdate`):
+
+- **tekst** — tytuł, podtytuł, opis
+- **Filmy/Seriale** — szybki przełącznik (`contentType` 0x1x)
+- **gatunek** — dropdown kategorii głównych DVB (EN 300 468)
+- **kanały** — nazwy oddzielone przecinkiem, dopasowanie częściowe (`TVP1, Polsat`)
+- **zakres dat** — `Od` / `Do` w formacie `YYYY-MM-DD` (puste = całe EPG)
+
+Przy aktywnym tekście widok automatycznie przełącza się na układ **Szukaj**.
+
+Nawigacja klawiaturą / pilotem HID (gdy aktywny tryb EPG):
+
+- ← / → — przesunięcie okna czasu o 30 min (siatka)
+- ↑ / ↓ — zmiana zaznaczonego kanału
+- Enter — audycja TERAZ → odtwarzaj; przyszła → przełącz nagrywanie
+- Home — skok do „teraz”
+- `g` / Guide — przejście do przewodnika
+
 ## Architektura
 
 ```
 main.py
 tvh/
-  htsmsg.py         # binarna (de)serializacja HTSMSG
-  client.py         # asyncio HtspClient: hello/auth/subscribe/DVR/EPG
-  async_bridge.py    # most asyncio (HTSP) <-> GLib (GTK), watek w tle
-  library.py          # TvhLibrary(GObject) - stan: kanaly/tagi/EPG/nagrania
-  models.py             # dataclasses: Channel, ChannelTag, EpgEvent, Recording
-  config.py              # zapis/odczyt konfiguracji polaczenia
+  htsmsg.py           # binarna (de)serializacja HTSMSG
+  client.py           # asyncio HtspClient: hello/auth/subscribe/DVR/EPG
+  async_bridge.py     # most asyncio (HTSP) <-> GLib (GTK), wątek w tle
+  library.py          # TvhLibrary(GObject) — stan: kanały/tagi/EPG/nagrania
+  models.py           # dataclasses: Channel, ChannelTag, EpgEvent, Recording
+  config.py           # zapis/odczyt konfiguracji połączenia
+  genres.py           # contentType (DVB) → etykieta PL + kolor kafelka
+  status_api.py       # HTTP JSON /api/status/inputs (siła sygnału w OSD)
 player/
-  gst_player.py       # appsrc -> decodebin -> gtk4paintablesink/autoaudiosink
-  stream_controller.py # spina subskrypcje HTSP (muxpkt) z GstPlayer
+  gst_player.py       # appsrc/playbin3 → decodebin → gtk4paintablesink
+  stream_controller.py # spina HTSP (ticket/muxpkt) z GstPlayer + preferencje
 ui/
-  app.py               # Adw.Application, ladowanie CSS
-  window.py             # Adw.ApplicationWindow, nawigacja, mini-player
-  connection_dialog.py   # dialog polaczenia z serwerem
-  channel_list.py          # lista kanalow TV/Radio z aktualnym programem
-  live_view.py               # obszar wideo + OSD (auto-hide) + fullscreen
-  epg_view.py                  # przewodnik: "teraz i za chwile" per kanal
-  recordings_view.py            # lista nagran DVR (stop/anuluj/usun)
-  recent_view.py                  # kafelki "ostatnio odtwarzane"
-  recent.py                        # trwaly magazyn historii (JSON)
-  mpris.py                          # serwis MPRIS2 dla appletu GNOME
-  style.css                          # akcenty na bazie zmiennych libadwaita
+  app.py              # Adw.Application, ładowanie CSS
+  window.py           # Adw.ApplicationWindow, szyna nawigacji, mini-player
+  connection_dialog.py
+  channel_list.py     # lista kanałów TV/Radio + filtr tagów/ulubionych
+  live_view.py        # wideo + OSD (auto-hide) + fullscreen + pasek postępu EPG
+  epg_view.py         # 3 układy EPG + wyszukiwanie parametryczne
+  epg_grid_view.py    # shim kompatybilności → EpgGridWidget
+  recordings_view.py  # lista nagrań DVR (stop/anuluj/usuń)
+  recent_view.py      # kafelki „ostatnio odtwarzane”
+  recent.py           # trwały magazyn historii (JSON)
+  mpris.py            # serwis MPRIS2 dla appletu GNOME
+  style.css           # akcenty na bazie zmiennych libadwaita
 ```
 
 ### Dlaczego appsrc, a nie zwykłe `uri=http://.../stream/channel/...`?
 
-Zadanie było jednoznaczne: "korzysta z HTSP z pełnią dostępnych funkcji".
-HTSP dostarcza surowe pakiety (`muxpkt`) przez to samo połączenie TCP na
+Zadanie było jednoznaczne: „korzysta z HTSP z pełnią dostępnych funkcji”.
+HTSP dostarcza surowe pakiety (`muxpkt`) przez to samo połączenie TCP, na
 którym leci sterowanie — nie ma tu adresu URL do podania `playbin`. Dlatego
 pipeline to `appsrc` karmiony bajtami z `HtspClient.on_muxpkt`, a dalej
 `decodebin` (autodetekcja kontenera/kodeków) rozdzielający się na gałąź
 wideo (`gtk4paintablesink`) i audio (`autoaudiosink`).
 
-Zaletą tego podejścia względem podejścia REST+HTTP (jak we `tvhplayer`)
-jest dostęp do pełnego zestawu funkcji HTSP: `subscriptionStatus`,
-`signalStatus` (siła/jakość sygnału tunera), `getTicket`, granularna kontrola
-DVR (`addDvrEntry` z `configUUID`, `cancelDvrEntry` vs `stopDvrEntry` vs
-`deleteDvrEntry`) i async EPG push (`eventAdd`/`eventUpdate` bez pollingu).
+Zaletą tego podejścia względem REST+HTTP (jak we `tvhplayer`) jest dostęp
+do pełnego zestawu funkcji HTSP: `getTicket`, granularna kontrola DVR
+(`addDvrEntry` z `configUUID`, `cancelDvrEntry` vs `stopDvrEntry` vs
+`deleteDvrEntry`) i async EPG push (`eventAdd` / `eventUpdate` bez pollingu).
+
+> **Uwaga (aktualność powyższego):** live TV faktycznie odtwarzane jest
+> przez `getTicket` + zwykły HTTP MPEG-TS + `playbin3`
+> (`StreamController.play_channel`), nie przez appsrc karmiony z
+> `muxpkt` — ta zmiana przyszła później, przy naprawianiu stabilności
+> VA-API/HEVC (patrz `player/gst_player.py`). appsrc zostaje jako ścieżka
+> dla nagrań/fallbacku. W konsekwencji `signalStatus` z HTSP (wymaga
+> aktywnej subskrypcji HTSP) nie nadchodzi dla live TV — siła sygnału DVB
+> w OSD jest zamiast tego odpytywana przez HTTP JSON API
+> `/api/status/inputs` (wymaga uprawnienia ADMIN na koncie), patrz
+> `tvh/status_api.py`.
 
 ## Stabilność odbioru / strojenie buforowania
 
 Odtwarzacz (`player/gst_player.py`) domyślnie priorytetyzuje stabilność nad
 latencją: ~1.5 s bufora w kolejkach GStreamera, ~1.2 s prerollu przed startem
-obrazu, renderowanie zsynchronizowane z zegarem pipeline'u (płynny pacing
-klatek/audio) oraz watchdog, który wykrywa ciszę w danych z HTSP (zator
-sieciowy) i automatycznie wraca do buforowania zamiast pozwolić obrazowi
-szarpać. Da się to przestroić zmiennymi środowiskowymi, jeśli wolisz niższą
-latencję kosztem odporności na jitter (albo odwrotnie, przy bardzo
-niestabilnej sieci):
+obrazu, renderowanie zsynchronizowane z zegarem pipeline’u (płynny pacing
+klatek/audio) oraz watchdog, który wykrywa ciszę w danych i automatycznie
+wraca do buforowania zamiast pozwolić obrazowi szarpać. Da się to przestroić
+zmiennymi środowiskowymi:
 
 | Zmienna | Domyślnie | Znaczenie |
 |---|---|---|
 | `TVH_BUFFER_MS` | `1500` | Rozmiar kolejek live (appsrc + queue) w ms |
 | `TVH_PREROLL_MS` | `1200` | Ile danych (wg PTS) zebrać przed pierwszym PLAYING |
 | `TVH_REBUFFER_MS` | `600` | Preroll po wykryciu zerwania strumienia (szybszy powrót) |
-| `TVH_STALL_TIMEOUT_MS` | `700` | Po ilu ms ciszy w danych watchdog uzna strumień za "zerwany" |
+| `TVH_STALL_TIMEOUT_MS` | `700` | Po ilu ms ciszy watchdog uzna strumień za „zerwany” |
 | `TVH_DISABLE_HW_HEVC` | `0` | `1` wyłącza sprzętowy dekoder HEVC (obejście buggy VA-API) |
+| `TVH_ENABLE_HW_HEVC` | `0` | `1` wymusza sprzętowy HEVC (VA-API); domyślnie HEVC idzie softem |
 | `TVH_HW_PROFILE_SWITCH_DELAY` | `0.4` | Opóźnienie (s) przy zmianie profilu sprzętowego dekodera |
 
 Jeśli mimo większego bufora nadal widać zacięcia, warto sprawdzić logi pod
@@ -110,17 +152,18 @@ kątem `Brak danych ze strumienia przez` (watchdog re-bufferingu) — to znak,
 
 ## Znane ograniczenia / do dopracowania
 
-- Detekcja "kanał radiowy vs TV" opiera się o obecność tagu z nazwą
-  zawierającą "radio" — jeśli Twój serwer nie ma takiego tagu, warto dodać
+- Detekcja „kanał radiowy vs TV” opiera się o obecność tagu z nazwą
+  zawierającą „radio” — jeśli Twój serwer nie ma takiego tagu, warto dodać
   heurystykę po obecności/braku strumienia wideo w `subscriptionStart`
   (pole `streams[].type`).
-- Widok EPG to lista "teraz / za chwilę" per kanał (jak pasek info w Kodi),
-  nie siatka czasowa. Siatka czasowa (kanały × oś czasu) to sensowny
-  następny krok — dobry kandydat na `Gtk.ColumnView` z customowym rysowaniem
-  bloków programów przez `Gtk.DrawingArea`/GSK.
-- Tray icon (StatusNotifierItem) celowo pominięty w tej wersji — na czystym
-  GNOME i tak wymaga rozszerzenia powłoki; zamiast tego zaimplementowano
-  MPRIS2, które działa natywnie w quick settings/OSD GNOME bez dodatków.
+- Wyszukiwanie EPG jest lokalne po cache HTSP; przy bardzo dużych bazach
+  można uzupełnić o serwerowe `epgQuery`.
+- Siatka EPG w OSD fullscreen (kompaktowy `EpgGridWidget`) nie jest jeszcze
+  podpięta pod klawisz Guide w trybie live — sama klasa jest gotowa
+  (`compact=True`).
+- Tray icon (StatusNotifierItem) celowo pominięty — na czystym GNOME i tak
+  wymaga rozszerzenia powłoki; zamiast tego jest MPRIS2 (quick settings /
+  OSD GNOME bez dodatków).
 - `gst4paintablesink` bywa nazwany `gtk4paintablesink` w zależności od
   wersji `gst-plugins-rs` — jeśli `Gst.ElementFactory.make` zwraca `None`,
   sprawdź `gst-inspect-1.0 | grep -i gtk4`.
