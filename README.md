@@ -166,6 +166,61 @@ do pełnego zestawu funkcji HTSP: `getTicket`, granularna kontrola DVR
 > `/api/status/inputs` (wymaga uprawnienia ADMIN na koncie), patrz
 > `tvh/status_api.py`.
 
+## Zero-copy VA-API na Wayland (gtk4paintablesink + glimagesink)
+
+Domyślna i **zalecana** ścieżka wideo na Waylandzie nie kopiuje klatek przez RAM.
+
+```
+vaapi<CODEC>dec / va<CODEC>dec
+        │  video/x-raw(memory:VAMemory)  albo  memory:DMABuf
+        ▼
+   glsinkbin  (to samo co glimagesink – GstGLSinkBin)
+        │  glupload importuje DMA-BUF przez EGL
+        │  eglCreateImageKHR(EGL_LINUX_DMA_BUF_EXT)
+        ▼
+gtk4paintablesink  →  GdkPaintable  →  Gtk.Picture
+        │
+        ▼
+Gtk.GraphicsOffload  →  compositor (Mutter/KWin) skanuje DMABuf
+```
+
+`videoconvert` (kopia CPU, zrywa DMABuf) jest używany **tylko** gdy w preferencjach wybierzesz „programowe”.
+
+### Preferencje odtwarzacza
+
+| Dekoder | Zachowanie |
+|---|---|
+| **auto** | HW dla H.264/MPEG-2/VP9/…; HEVC HW tylko z `TVH_ENABLE_HW_HEVC=1` |
+| **sprzętowy VA-API** | **Wszystkie** `va*` / `vaapi*` decodery, w tym HEVC, JPEG, MPEG-4, VP8, VC-1/WMV3. Ranking `PRIMARY+256`. |
+| **programowy** | `avdec_*` / libde265 |
+
+| Wyjście wideo | Pipeline |
+|---|---|
+| **auto** (zalecane) | Wayland: `glsinkbin sink=gtk4paintablesink` |
+| **gtk4paintablesink + glsinkbin** | DMABuf → glupload → Gtk.Picture (zero-copy) |
+| **glimagesink / glsinkbin** | ta sama ścieżka GL; bez gtk4 → prawdziwy `glimagesink` |
+| **VA surface / DMABuf** | `gtk4paintablesink` bezpośrednio (GDK importuje DMABuf) |
+| **vapostproc** | konwersja formatu po stronie GPU, nadal DMABuf |
+| **programowe** | `videoconvert` → kopia do system memory |
+
+### Dekodery sprzętowe (`vaapi<CODEC>dec` + `va<CODEC>dec`)
+
+| Kodek | gstreamer-va | gstreamer-vaapi (legacy) |
+|---|---|---|
+| H.264 AVC / MVC | `vah264dec` | `vaapih264dec` |
+| HEVC | `vah265dec` | `vaapih265dec` |
+| MPEG-2 | `vampeg2dec` | `vaapimpeg2dec` |
+| MPEG-4 Part 2 | `vampeg4dec` | `vaapimpeg4dec` |
+| VP8 | `vavp8dec` | `vaapivp8dec` |
+| VP9 | `vavp9dec` | `vaapivp9dec` |
+| VC-1 / WMV3 | `vavc1dec` | `vaapivc1dec` |
+| JPEG / MJPEG | `vajpegdec` | `vaapijpegdec` |
+| AV1 | `vaav1dec` | `vaapiav1dec` |
+
+Przed `Gst.init()` ustawiane jest `GST_GL_WINDOW=wayland`, `GST_GL_PLATFORM=egl` oraz `GST_VAAPI_ALL_DRIVERS=1` (legacy vaapi na AMD/NVIDIA).
+
+W logu szukaj linii `Pipeline path: … zerocopy=True` – to potwierdza, że klatki nie idą przez `videoconvert`.
+
 ## Stabilność odbioru / strojenie buforowania
 
 Odtwarzacz (`player/gst_player.py`) domyślnie priorytetyzuje stabilność nad
