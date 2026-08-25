@@ -80,7 +80,11 @@ class PlayerPreferences:
     """Preferencje odtwarzacza: dekodery, wyjście wideo, języki audio/napisów."""
 
     # decoder_pref: "auto" | "hw" | "sw"
-    # video_output: "auto" | "va-surface" | "vapostproc" | "software"
+    # video_output: "auto" | "gtk4" | "glimagesink" | "va-surface" | "vapostproc" | "gl" | "software"
+    _VIDEO_OUTPUTS = (
+        "auto", "gtk4", "glimagesink", "va-surface", "vapostproc", "gl", "software",
+    )
+
     def __init__(
         self,
         decoder_pref: str = "auto",
@@ -92,9 +96,7 @@ class PlayerPreferences:
     ):
         self.decoder_pref = decoder_pref if decoder_pref in ("auto", "hw", "sw") else "auto"
         self.video_output = (
-            video_output
-            if video_output in ("auto", "va-surface", "vapostproc", "gl", "software")
-            else "auto"
+            video_output if video_output in self._VIDEO_OUTPUTS else "auto"
         )
         sys_langs = _system_lang_codes()
         self.preferred_audio_langs = list(preferred_audio_langs) if preferred_audio_langs else list(sys_langs)
