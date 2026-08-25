@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import time
 from typing import Optional
 
@@ -48,20 +49,24 @@ class LiveView(Gtk.Box):
         self.picture = Gtk.Picture()
         self.picture.set_content_fit(Gtk.ContentFit.CONTAIN)
 
-        # Gtk.GraphicsOffload (GTK >=4.14): pozwala compositorowi (Wayland)
-        # scanowac klatke wideo bezposrednio z DMABuf, z pominieciem GSK -
-        # to jest "prawdziwy" odpowiednik tego, co dawaloby wpiecie
-        # waylandsink, ale bez utraty osadzenia w widget tree / OSD.
-        # Dziala automatycznie tylko gdy nic nie jest rysowane na wierzchu
-        # (OSD/spinner) - w przeciwnym razie po cichu wraca do zwyklej
-        # kompozycji, wiec bezpiecznie wlaczamy to zawsze gdy dostepne.
-        # GraphicsOffload bywa czarny ekran z gtk4paintablesink – wyłączone
-        offload_cls = None  # getattr(Gtk, "GraphicsOffload", None)
-        if offload_cls is not None:
+        # Gtk.GraphicsOffload (GTK >=4.14): compositor Wayland skanuje klatkę
+        # wideo bezpośrednio z DMABuf (gtk4paintablesink → GdkDmabufTexture),
+        # z pominięciem GSK. Działa gdy sink dostarcza DMABuf/GL – czyli przy
+        # zero-copy (gtk4paintablesink / glsinkbin). Przy software/videoconvert
+        # Offload po cichu wraca do zwykłej kompozycji.
+        offload_cls = getattr(Gtk, "GraphicsOffload", None)
+        wayland = bool(os.environ.get("WAYLAND_DISPLAY")) or (
+            os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland"
+        )
+        if offload_cls is not None and wayland:
             self.video_widget = offload_cls()
             self.video_widget.set_child(self.picture)
             try:
                 self.video_widget.set_enabled(True)
+            except Exception:
+                pass
+            try:
+                self.video_widget.set_black_background(True)
             except Exception:
                 pass
         else:
@@ -318,11 +323,10 @@ class LiveView(Gtk.Box):
         self._show_osd_temporarily()
 
     def _on_decoder_chosen(self, _player, element_name: str, kind: str) -> None:
-        label = (
-            "Dekodowanie: VA-API (sprzętowe)"
-            if kind == "vaapi"
-            else f"Dekodowanie: programowe ({element_name})"
-        )
+        if kind == "vaapi":
+            label = f"Dekodowanie: VA-API · {element_name} (zero-copy)"
+        else:
+            label = f"Dekodowanie: programowe ({element_name})"
         self.decoder_lbl.set_text(label)
         self.decoder_lbl.set_visible(True)
 
@@ -709,32 +713,54 @@ class LiveView(Gtk.Box):
         prefs = load_player_prefs()
 
         dialog = Adw.PreferencesWindow(transient_for=self.window, title="Preferencje odtwarzacza")
-        dialog.set_default_size(480, 420)
+        dialog.set_default_size(560, 520)
 
         page = Adw.PreferencesPage(title="Odtwarzacz", icon_name="multimedia-player-symbolic")
         dialog.add(page)
 
         # --- Dekoder ---
-        group_dec = Adw.PreferencesGroup(title="Dekoder wideo")
+        group_dec = Adw.PreferencesGroup(
+            title="Dekoder wideo",
+            description="Sprzętowy (VA-API) wymusza va*/vaapi*dec dla H.264, HEVC, "
+            "MPEG-2, MPEG-4, VP8/VP9, VC-1/WMV3, JPEG, AV1. Klatki zostają w "
+            "DMABuf – zero-copy do gtk4paintablesink / glimagesink.",
+        )
         page.add(group_dec)
         decoder_row = Adw.ComboRow(title="Preferencja dekodera")
-        decoder_row.set_model(Gtk.StringList.new(["auto (zalecane)", "sprzętowy (VA-API)", "programowy"]))
+        decoder_row.set_model(Gtk.StringList.new([
+            "auto (HW tam gdzie stabilne)",
+            "sprzętowy VA-API (wszystkie kodeki, zero-copy)",
+            "programowy (CPU)",
+        ]))
         idx = {"auto": 0, "hw": 1, "sw": 2}.get(prefs.decoder_pref, 0)
         decoder_row.set_selected(idx)
         group_dec.add(decoder_row)
 
         # --- Wyjście wideo ---
-        group_out = Adw.PreferencesGroup(title="Wyjście wideo")
+        group_out = Adw.PreferencesGroup(
+            title="Wyjście wideo (Wayland zero-copy)",
+            description="Zalecane: gtk4paintablesink albo glimagesink/glsinkbin. "
+            "Oba importują DMABuf przez EGL – bez kopii przez RAM.",
+        )
         page.add(group_out)
         output_row = Adw.ComboRow(title="Ścieżka wyjścia")
         output_row.set_model(Gtk.StringList.new([
-            "auto (najlepsze dostępne)",
-            "VA surface / DMABuf (zero-copy)",
-            "vapostproc",
-            "OpenGL (glupload)",
-            "programowe (videoconvert)",
+            "auto (Wayland: gtk4paintablesink + glsinkbin)",
+            "gtk4paintablesink + glsinkbin (zalecane, zero-copy)",
+            "glimagesink / glsinkbin (OpenGL Wayland, zero-copy)",
+            "VA surface / DMABuf bezpośrednio (GDK)",
+            "vapostproc (konwersja GPU, zero-copy)",
+            "programowe (videoconvert, kopia CPU)",
         ]))
-        oidx = {"auto": 0, "va-surface": 1, "vapostproc": 2, "gl": 3, "software": 4}.get(prefs.video_output, 0)
+        oidx = {
+            "auto": 0,
+            "gtk4": 1,
+            "gl": 2,
+            "glimagesink": 2,
+            "va-surface": 3,
+            "vapostproc": 4,
+            "software": 5,
+        }.get(prefs.video_output, 0)
         output_row.set_selected(oidx)
         group_out.add(output_row)
 
@@ -764,7 +790,14 @@ class LiveView(Gtk.Box):
 
         def _save(*_a):
             dmap = {0: "auto", 1: "hw", 2: "sw"}
-            omap = {0: "auto", 1: "va-surface", 2: "vapostproc", 3: "gl", 4: "software"}
+            omap = {
+                0: "auto",
+                1: "gtk4",
+                2: "glimagesink",
+                3: "va-surface",
+                4: "vapostproc",
+                5: "software",
+            }
             new_prefs = PlayerPreferences(
                 decoder_pref=dmap.get(decoder_row.get_selected(), "auto"),
                 video_output=omap.get(output_row.get_selected(), "auto"),
