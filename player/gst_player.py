@@ -14,13 +14,18 @@ z jawnymi caps na podstawie typu z subscriptionStart.
 
 Audio: jawny łańcuch parser + dekoder (bez decodebin), z listą fallbacków.
 Wideo: jawny łańcuch parse+dekoder (VA/SW) pod live HTSP ES; decodebin tylko fallback.
-  Post-decode: próbuje direct → vapostproc → software (zero-copy jak Totem),
-  bez zbędnego videoconvert przy VAAPI.
+  Post-decode Wayland ZERO-COPY (zalecane):
+    gtk4paintablesink  – GdkPaintable w Gtk.Picture (DMABuf / GLMemory)
+    glimagesink        – GstGLSinkBin: glupload importuje DMABuf przez EGL
+    glsinkbin sink=gtk4paintablesink
+        va*dec/vaapi*dec → VAMemory|DMABuf → glupload → gtk4paintablesink
+  videoconvert TYLKO przy video_output=software (kopia CPU zrywa DMABuf).
+  HW: JPEG, MPEG-2, MPEG-4:2, H.264 AVC/MVC, VP8, VP9, VC-1, WMV3, HEVC, AV1.
 Napisy: appsrc → dvbsuboverlay (nakładka na wideo).
 
 Preferencje (PlayerPreferences):
   - decoder_pref: auto | hw | sw  – wpływ na ranking dekoderów VA-API
-  - video_output: auto | va-surface | vapostproc | software | gl
+  - video_output: auto | gtk4 | glimagesink | va-surface | vapostproc | gl | software
 """
 from __future__ import annotations
 
@@ -32,6 +37,24 @@ import time
 from typing import List, Optional, TYPE_CHECKING
 
 import gi
+
+# EGL + Wayland MUSZĄ być ustawione zanim Gst.init() stworzy GstGLDisplay,
+# inaczej glupload nie zaimportuje DMABuf (zero-copy pada do kopii CPU).
+def _prepare_wayland_gl_env() -> None:
+    gdk_backend = (os.environ.get("GDK_BACKEND") or "").lower()
+    wayland = bool(os.environ.get("WAYLAND_DISPLAY")) or (
+        os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland"
+    )
+    if gdk_backend == "x11":
+        wayland = False
+    if wayland or gdk_backend == "wayland":
+        os.environ.setdefault("GST_GL_WINDOW", "wayland")
+        os.environ.setdefault("GST_GL_PLATFORM", "egl")
+    # Legacy gstreamer-vaapi na AMD/NVIDIA (Intel działa bez tego).
+    os.environ.setdefault("GST_VAAPI_ALL_DRIVERS", "1")
+
+
+_prepare_wayland_gl_env()
 
 gi.require_version("Gst", "1.0")
 gi.require_version("GstApp", "1.0")
@@ -46,11 +69,21 @@ Gst.init(None)
 
 VIDEO_CAPS = {
     "H264": "video/x-h264,stream-format=byte-stream,alignment=nal",
+    "H264MVC": "video/x-h264,stream-format=byte-stream,alignment=nal",
+    "H.264": "video/x-h264,stream-format=byte-stream,alignment=nal",
     "HEVC": "video/x-h265,stream-format=byte-stream,alignment=au",
+    "H265": "video/x-h265,stream-format=byte-stream,alignment=au",
     "MPEG2VIDEO": "video/mpeg,mpegversion=2,systemstream=false",
+    "MPEG2": "video/mpeg,mpegversion=2,systemstream=false",
+    "MPEG4VIDEO": "video/mpeg,mpegversion=4,systemstream=false",
+    "MPEG4": "video/mpeg,mpegversion=4,systemstream=false",
     "VP8": "video/x-vp8",
     "VP9": "video/x-vp9",
     "AV1": "video/x-av1",
+    "VC1": "video/x-wmv,wmvversion=3,format=WVC1",
+    "WMV3": "video/x-wmv,wmvversion=3",
+    "JPEG": "image/jpeg",
+    "MJPEG": "image/jpeg",
 }
 
 # Jawne łańcuchy wideo (parser, lista dekoderów HW→SW) – bez decodebin = niższa latencja live
@@ -60,30 +93,80 @@ VIDEO_DECODER_CHAIN = {
         "hw": ["vah264dec", "vaapih264dec"],
         "sw": ["avdec_h264", "openh264dec"],
     },
+    "H264MVC": {
+        "parser": "h264parse",
+        "hw": ["vah264dec", "vaapih264dec"],
+        "sw": ["avdec_h264"],
+    },
+    "H.264": {
+        "parser": "h264parse",
+        "hw": ["vah264dec", "vaapih264dec"],
+        "sw": ["avdec_h264", "openh264dec"],
+    },
     "HEVC": {
         "parser": "h265parse",
         "hw": ["vah265dec", "vaapih265dec"],
-        "sw": ["avdec_h265"],
+        "sw": ["avdec_h265", "libde265dec"],
+    },
+    "H265": {
+        "parser": "h265parse",
+        "hw": ["vah265dec", "vaapih265dec"],
+        "sw": ["avdec_h265", "libde265dec"],
     },
     "MPEG2VIDEO": {
         "parser": "mpegvideoparse",
         "hw": ["vampeg2dec", "vaapimpeg2dec"],
         "sw": ["avdec_mpeg2video", "mpeg2dec"],
     },
+    "MPEG2": {
+        "parser": "mpegvideoparse",
+        "hw": ["vampeg2dec", "vaapimpeg2dec"],
+        "sw": ["avdec_mpeg2video", "mpeg2dec"],
+    },
+    "MPEG4VIDEO": {
+        "parser": "mpeg4videoparse",
+        "hw": ["vampeg4dec", "vaapimpeg4dec"],
+        "sw": ["avdec_mpeg4"],
+    },
+    "MPEG4": {
+        "parser": "mpeg4videoparse",
+        "hw": ["vampeg4dec", "vaapimpeg4dec"],
+        "sw": ["avdec_mpeg4"],
+    },
     "VP9": {
-        "parser": None,
+        "parser": "vp9parse",
         "hw": ["vavp9dec", "vaapivp9dec"],
         "sw": ["avdec_vp9", "vp9dec"],
     },
     "AV1": {
-        "parser": None,
-        "hw": ["vaav1dec"],
-        "sw": ["avdec_av1"],
+        "parser": "av1parse",
+        "hw": ["vaav1dec", "vaapiav1dec"],
+        "sw": ["avdec_av1", "dav1ddec"],
     },
     "VP8": {
-        "parser": None,
-        "hw": [],
+        "parser": "vp8parse",
+        "hw": ["vavp8dec", "vaapivp8dec"],
         "sw": ["avdec_vp8", "vp8dec"],
+    },
+    "VC1": {
+        "parser": None,
+        "hw": ["vavc1dec", "vaapivc1dec"],
+        "sw": ["avdec_vc1", "avdec_wmv3"],
+    },
+    "WMV3": {
+        "parser": None,
+        "hw": ["vavc1dec", "vaapivc1dec"],
+        "sw": ["avdec_wmv3", "avdec_vc1"],
+    },
+    "JPEG": {
+        "parser": "jpegparse",
+        "hw": ["vajpegdec", "vaapijpegdec"],
+        "sw": ["jpegdec"],
+    },
+    "MJPEG": {
+        "parser": "jpegparse",
+        "hw": ["vajpegdec", "vaapijpegdec"],
+        "sw": ["jpegdec"],
     },
 }
 
@@ -229,14 +312,22 @@ AUDIO_DECODER_CHAIN = {
 }
 
 _HW_DECODER_FACTORIES = [
-    "vah264dec", "vah265dec", "vavp9dec", "vaav1dec", "vampeg2dec",
-    "vaapih264dec", "vaapih265dec", "vaapimpeg2dec", "vaapivp9dec", "vaapidecodebin",
+    # gstreamer-va (gst-plugins-bad, zalecane)
+    "vah264dec", "vah265dec", "vavp8dec", "vavp9dec", "vaav1dec",
+    "vampeg2dec", "vampeg4dec", "vavc1dec", "vajpegdec",
+    # gstreamer-vaapi (legacy): JPEG, MPEG-2, MPEG-4:2, H.264 AVC/MVC,
+    # VP8, VP9, VC-1, WMV3, HEVC → VA surfaces / DMABuf
+    "vaapih264dec", "vaapih265dec", "vaapivp8dec", "vaapivp9dec",
+    "vaapimpeg2dec", "vaapimpeg4dec", "vaapivc1dec", "vaapijpegdec",
+    "vaapiav1dec", "vaapidecodebin",
 ]
 
 _HEVC_HW_FACTORIES = ("vah265dec", "vaapih265dec")
 _AVC_HW_FACTORIES = ("vah264dec", "vaapih264dec")
-# HEVC VA na AMD (VCN) + playbin/gtk4 → częsty crash (amdgpu CS -22).
-# Domyślnie WYŁĄCZONE. Włącz świadomie: TVH_ENABLE_HW_HEVC=1
+# HEVC VA na AMD (VCN) + playbin/gtk4 bywał niestabilny przy wymuszonej
+# kopii DMA→RAM (amdgpu CS -22). Przy prawdziwym zero-copy (glsinkbin /
+# gtk4paintablesink) HW HEVC jest bezpieczny gdy user wybierze "hw".
+# auto: HW HEVC tylko z TVH_ENABLE_HW_HEVC=1.
 _ENABLE_HW_HEVC = os.environ.get("TVH_ENABLE_HW_HEVC", "0") == "1"
 _HW_PROFILE_SWITCH_DELAY_S = float(os.environ.get("TVH_HW_PROFILE_SWITCH_DELAY", "0.4"))
 
@@ -244,13 +335,37 @@ _HW_PROFILE_SWITCH_DELAY_S = float(os.environ.get("TVH_HW_PROFILE_SWITCH_DELAY",
 _BUFFER_MS = int(os.environ.get("TVH_BUFFER_MS", "1500"))
 _STALL_TIMEOUT_MS = int(os.environ.get("TVH_STALL_TIMEOUT_MS", "700"))
 
+_ZEROCOPY_OUTPUTS = frozenset(
+    ("auto", "gtk4", "glimagesink", "va-surface", "vapostproc", "gl")
+)
+
+
+def _is_wayland() -> bool:
+    gdk_backend = (os.environ.get("GDK_BACKEND") or "").lower()
+    if gdk_backend == "x11":
+        return False
+    if gdk_backend == "wayland":
+        return True
+    return bool(os.environ.get("WAYLAND_DISPLAY")) or (
+        os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland"
+    )
+
+
+def _hw_hevc_allowed(decoder_pref: str) -> bool:
+    """HW HEVC: zawsze przy jawnym 'hw'; przy 'auto' tylko z env."""
+    if decoder_pref == "sw":
+        return False
+    if decoder_pref == "hw":
+        return True
+    return _ENABLE_HW_HEVC
+
 
 def _hw_video_profile(video_type: Optional[str]) -> Optional[str]:
     if video_type is None:
         return None
-    if video_type == "HEVC":
+    if video_type in ("HEVC", "H265"):
         return "hevc"
-    if video_type == "H264":
+    if video_type in ("H264", "H.264", "H264MVC"):
         return "avc"
     return video_type
 
@@ -263,14 +378,20 @@ def _make(factory_name: str, name: Optional[str] = None):
 
 
 def _boost_decoder_ranks(decoder_pref: str = "auto") -> None:
-    """Ustaw ranking dekoderów wg preferencji użytkownika."""
+    """Ustaw ranking dekoderów wg preferencji użytkownika.
+
+    decoder_pref=hw → WSZYSTKIE va*/vaapi*dec (w tym HEVC/JPEG/VC1/VP8/MPEG4)
+    dostają PRIMARY+256, żeby playbin/decodebin zawsze wybrał HW, a sink
+    zero-copy (gtk4paintablesink / glimagesink) dostał VAMemory/DMABuf.
+    """
     registry = Gst.Registry.get()
+    hevc_ok = _hw_hevc_allowed(decoder_pref)
     hw = []
     for name in _HW_DECODER_FACTORIES:
         feature = registry.find_feature(name, Gst.ElementFactory)
         if feature is None:
             continue
-        if name in _HEVC_HW_FACTORIES and not _ENABLE_HW_HEVC:
+        if name in _HEVC_HW_FACTORIES and not hevc_ok:
             feature.set_rank(Gst.Rank.NONE)
             continue
         if decoder_pref == "sw":
@@ -278,28 +399,29 @@ def _boost_decoder_ranks(decoder_pref: str = "auto") -> None:
         elif decoder_pref == "hw":
             feature.set_rank(Gst.Rank.PRIMARY + 256)
         else:  # auto
-            # HEVC VA + AMD VCN + gtk4/playbin bywa niestabilne (amdgpu CS -22).
-            # H264 VA zostaje PRIMARY; HEVC VA → SECONDARY (avdec_h265 wygrywa).
             if name in _HEVC_HW_FACTORIES:
                 feature.set_rank(Gst.Rank.SECONDARY)
             else:
                 feature.set_rank(Gst.Rank.PRIMARY + 128)
         hw.append(name)
     if hw:
-        logger.info("VA-API (%s): %s", decoder_pref, ", ".join(hw))
+        logger.info(
+            "VA-API (%s, wayland=%s, hevc_hw=%s): %s",
+            decoder_pref, _is_wayland(), hevc_ok, ", ".join(hw),
+        )
     else:
         logger.info("VA-API niedostępne – dekodowanie wideo programowe")
 
-    if _ENABLE_HW_HEVC:
+    if hevc_ok:
         logger.info(
-            "Sprzetowy HEVC (vah265dec) WLACZONY (TVH_ENABLE_HW_HEVC=1) – "
-            "odstep %.2fs przy zmianie AVC<->HEVC.",
-            _HW_PROFILE_SWITCH_DELAY_S,
+            "Sprzętowy HEVC WŁĄCZONY (pref=%s, TVH_ENABLE_HW_HEVC=%s) – "
+            "odstęp %.2fs przy zmianie AVC<->HEVC.",
+            decoder_pref, int(_ENABLE_HW_HEVC), _HW_PROFILE_SWITCH_DELAY_S,
         )
     else:
         logger.info(
-            "Sprzetowy HEVC wylaczony – HEVC idzie avdec_h265/libde265 "
-            "(bezpiecznie na AMD). Wlaczenie: TVH_ENABLE_HW_HEVC=1"
+            "Sprzętowy HEVC wyłączony – HEVC idzie avdec_h265/libde265. "
+            "Włączenie: dekoder=sprzętowy w preferencjach albo TVH_ENABLE_HW_HEVC=1"
         )
 
     libav = []
@@ -307,19 +429,24 @@ def _boost_decoder_ranks(decoder_pref: str = "auto") -> None:
         "avdec_ac3", "avdec_eac3", "avdec_aac", "avdec_mp2", "avdec_mpa",
         "avdec_mp3", "avdec_dca", "avdec_truehd", "avdec_opus", "avdec_vorbis",
         "avdec_flac", "mpg123audiodec", "avdec_h265", "avdec_h264",
+        "avdec_mpeg2video", "avdec_mpeg4", "avdec_vp8", "avdec_vp9",
+        "avdec_vc1", "avdec_wmv3", "avdec_av1", "jpegdec",
     ):
         feature = registry.find_feature(name, Gst.ElementFactory)
         if feature is not None:
-            if name in ("avdec_h265",) and not _ENABLE_HW_HEVC:
+            if name in ("avdec_h265",) and not hevc_ok:
                 feature.set_rank(Gst.Rank.PRIMARY + 200)
             elif decoder_pref == "hw":
-                feature.set_rank(Gst.Rank.SECONDARY)
+                feature.set_rank(Gst.Rank.MARGINAL)
             else:
                 feature.set_rank(Gst.Rank.PRIMARY + 96)
             libav.append(name)
     de265 = registry.find_feature("libde265dec", Gst.ElementFactory)
-    if de265 is not None and not _ENABLE_HW_HEVC:
-        de265.set_rank(Gst.Rank.PRIMARY + 150)
+    if de265 is not None:
+        if not hevc_ok:
+            de265.set_rank(Gst.Rank.PRIMARY + 150)
+        elif decoder_pref == "hw":
+            de265.set_rank(Gst.Rank.MARGINAL)
         libav.append("libde265dec")
     if libav:
         logger.info("gst-libav / audio: %s", ", ".join(libav))
@@ -428,9 +555,10 @@ class GstPlayer(GObject.GObject):
         enable_hw = True
         if self._prefs and self._prefs.decoder_pref == "sw":
             enable_hw = False
+        dec_pref = (self._prefs.decoder_pref if self._prefs else "auto") or "auto"
         if (
             enable_hw
-            and _ENABLE_HW_HEVC
+            and _hw_hevc_allowed(dec_pref)
             and prev_profile is not None
             and new_profile is not None
             and prev_profile != new_profile
@@ -649,7 +777,7 @@ class GstPlayer(GObject.GObject):
             order = list(chain["hw"]) + list(chain["sw"])
         else:
             order = list(chain["hw"]) + list(chain["sw"])
-        if not _ENABLE_HW_HEVC and video_type == "HEVC":
+        if not _hw_hevc_allowed(pref) and video_type in ("HEVC", "H265"):
             order = [n for n in order if n not in _HEVC_HW_FACTORIES]
         parser_name = chain.get("parser")
         for dec_name in order:
@@ -657,12 +785,17 @@ class GstPlayer(GObject.GObject):
             if dec is None:
                 continue
             parser = None
+            used_parser = parser_name
             if parser_name:
                 parser = _make(parser_name)
                 if parser is None:
-                    continue
+                    logger.debug(
+                        "Brak parsera %s dla %s – próbuję dekoder bez parsera",
+                        parser_name, dec_name,
+                    )
+                    used_parser = None
             kind = "vaapi" if dec_name.startswith(("va", "vaapi")) else "software"
-            return parser, dec, dec_name, kind, parser_name
+            return parser, dec, dec_name, kind, used_parser
         return None
 
     def _build_video_branch(
@@ -698,22 +831,10 @@ class GstPlayer(GObject.GObject):
         self._configure_live_queue(queue_in)
         self._configure_live_queue(queue_out)
 
-        video_sink = _make("gtk4paintablesink", "vsink")
-        if video_sink is None:
-            logger.warning("Brak gtk4paintablesink – fakesink")
-            video_sink = _make("fakesink", "vsink")
+        video_sink = self._make_inner_video_sink()
         if video_sink is None:
             logger.error("brak video sink")
             return None
-
-        self.video_sink = video_sink
-        self._configure_live_sink(video_sink, is_video=True)
-        try:
-            paintable = video_sink.get_property("paintable")
-            self._paintable = paintable
-            self.emit("paintable-ready", paintable)
-        except Exception:
-            logger.exception("paintable")
 
         if parser is not None:
             for prop, val in (
@@ -745,27 +866,44 @@ class GstPlayer(GObject.GObject):
                     return
             candidates.append((name, factories))
 
+        # Zero-copy: dekoder VA → DMABuf/VAMemory → sink (gtk4 / glupload).
+        # videoconvert TYLKO jako ostatni fallback albo przy pref=software.
         if kind == "vaapi":
-            # Wymuszamy DMA copy (videoconvert) na AMD APU Carrizo, aby całkowicie 
-            # uniknąć crashu amdgpu (CS -22) i zapychania VRAM.
-            if pref == "va-surface":
-                _add_candidate("direct", [])
-            if pref in ("va-surface", "vapostproc", "auto"):
-                _add_candidate("vapostproc+videoconvert", ["vapostproc", "videoconvert"])
-                _add_candidate("vadeinterlace+vapostproc+videoconvert", ["vadeinterlace", "vapostproc", "videoconvert"])
-                _add_candidate("vapostproc", ["vapostproc"])
-            _add_candidate("videoconvert", ["videoconvert"])
-            _add_candidate("deinterlace+videoconvert", ["deinterlace", "videoconvert"])
-            if pref == "va-surface":
-                _add_candidate("direct", [])
-        else:
-            if pref != "va-surface":
+            if pref == "software":
+                _add_candidate("videoconvert", ["videoconvert"])
                 _add_candidate("deinterlace+videoconvert", ["deinterlace", "videoconvert"])
-                _add_candidate("videoconvert", ["videoconvert"])
                 _add_candidate("direct", [])
+            elif pref in ("gl", "glimagesink"):
+                _add_candidate("glupload+glcolorconvert", ["glupload", "glcolorconvert"])
+                _add_candidate("vapostproc+glupload+glcolorconvert", ["vapostproc", "glupload", "glcolorconvert"])
+                _add_candidate("vaapipostproc+glupload+glcolorconvert", ["vaapipostproc", "glupload", "glcolorconvert"])
+                _add_candidate("glupload", ["glupload"])
+                _add_candidate("vapostproc", ["vapostproc"])
+                _add_candidate("direct", [])
+            elif pref == "vapostproc":
+                _add_candidate("vapostproc", ["vapostproc"])
+                _add_candidate("vaapipostproc", ["vaapipostproc"])
+                _add_candidate("vadeinterlace+vapostproc", ["vadeinterlace", "vapostproc"])
+                _add_candidate("direct", [])
+                _add_candidate("glupload+glcolorconvert", ["glupload", "glcolorconvert"])
             else:
+                # auto / gtk4 / va-surface: najpierw direct DMABuf, potem GPU convert
                 _add_candidate("direct", [])
+                _add_candidate("vapostproc", ["vapostproc"])
+                _add_candidate("vaapipostproc", ["vaapipostproc"])
+                _add_candidate("glupload+glcolorconvert", ["glupload", "glcolorconvert"])
+                _add_candidate("vapostproc+glupload+glcolorconvert", ["vapostproc", "glupload", "glcolorconvert"])
+                _add_candidate("vadeinterlace+vapostproc", ["vadeinterlace", "vapostproc"])
                 _add_candidate("videoconvert", ["videoconvert"])
+        else:
+            if pref in ("gl", "glimagesink"):
+                _add_candidate("glupload+glcolorconvert", ["glupload", "glcolorconvert"])
+                _add_candidate("glupload", ["glupload"])
+            if pref != "software":
+                _add_candidate("direct", [])
+            _add_candidate("deinterlace+videoconvert", ["deinterlace", "videoconvert"])
+            _add_candidate("videoconvert", ["videoconvert"])
+            _add_candidate("direct", [])
 
         if not candidates:
             _add_candidate("direct", [])
@@ -821,21 +959,13 @@ class GstPlayer(GObject.GObject):
             chain_ok = True
             cur = queue_out
             for el in mids + [video_sink]:
-                # Wymuś system-memory na wyjściu videoconvert, aby zerwać VA/DMABuf
-                link_caps = None
-                if el == video_sink and cur.get_factory() and cur.get_factory().get_name() == "videoconvert":
-                    link_caps = Gst.Caps.from_string("video/x-raw,format=NV12")
-                
-                if link_caps is not None:
-                    if not cur.link_filtered(el, link_caps):
-                        chain_ok = False
-                        logger.debug("explicit post-decode link fail (filtered) [%s]: %s -> %s", path_name, cur.get_name(), el.get_name())
-                        break
-                else:
-                    if not cur.link(el):
-                        chain_ok = False
-                        logger.debug("explicit post-decode link fail [%s]: %s -> %s", path_name, cur.get_name(), el.get_name())
-                        break
+                if not cur.link(el):
+                    chain_ok = False
+                    logger.debug(
+                        "explicit post-decode link fail [%s]: %s -> %s",
+                        path_name, cur.get_name(), el.get_name(),
+                    )
+                    break
                 cur = el
 
             if not chain_ok:
@@ -866,11 +996,16 @@ class GstPlayer(GObject.GObject):
         mid_names = " ! ".join(
             (el.get_factory().get_name() if el.get_factory() else "?") for el in linked_mids
         ) if linked_mids else "(direct)"
+        sink_name = (
+            video_sink.get_factory().get_name() if video_sink.get_factory() else "vsink"
+        )
         logger.info(
-            "Video live chain: appsrc ! … ! %s ! %s ! gtk4paintablesink  [path=%s]",
+            "Video live chain: appsrc ! … ! %s ! %s ! %s  [path=%s zerocopy=%s]",
             dec_name,
             mid_names,
+            sink_name,
             used_path,
+            used_path not in ("videoconvert", "deinterlace+videoconvert"),
         )
         return appsrc
 
@@ -957,6 +1092,7 @@ class GstPlayer(GObject.GObject):
     ) -> List[tuple]:
         pref = (self._prefs.video_output if self._prefs else "auto") or "auto"
         has_vapost = _make("vapostproc") is not None
+        has_vaapipost = _make("vaapipostproc") is not None
         has_vadeint = _make("vadeinterlace") is not None
         has_glupload = _make("glupload") is not None
         has_glcolor = _make("glcolorconvert") is not None
@@ -979,6 +1115,14 @@ class GstPlayer(GObject.GObject):
             add("direct-va/dmabuf", [])
             if has_vapost:
                 add("vapostproc", ["vapostproc"])
+            if has_vaapipost:
+                add("vaapipostproc", ["vaapipostproc"])
+            if has_glupload and has_glcolor:
+                add("glupload+glcolorconvert", ["glupload", "glcolorconvert"])
+            elif has_glupload:
+                add("glupload", ["glupload"])
+            if has_vapost and has_glupload and has_glcolor:
+                add("vapostproc+glupload+glcolorconvert", ["vapostproc", "glupload", "glcolorconvert"])
             if interlaced and has_vadeint and has_videoconvert:
                 add("vadeinterlace+videoconvert", ["vadeinterlace", "videoconvert"])
             if has_videoconvert:
@@ -994,21 +1138,18 @@ class GstPlayer(GObject.GObject):
                 add("videoconvert", ["videoconvert"])
 
         else:
+            if pref in ("gl", "glimagesink", "gtk4", "auto") and has_glupload:
+                if has_glcolor:
+                    add("glupload+glcolorconvert", ["glupload", "glcolorconvert"])
+                add("glupload", ["glupload"])
             if interlaced:
                 if has_deinterlace and has_videoconvert:
                     add("deinterlace+videoconvert", ["deinterlace", "videoconvert"])
                 elif has_deinterlace:
                     add("deinterlace", ["deinterlace"])
-
+            add("direct-system", [])
             if has_videoconvert:
                 add("videoconvert", ["videoconvert"])
-            add("direct-system", [])
-
-            if pref == "gl":
-                if has_glupload and has_glcolor:
-                    paths.insert(0, ("glupload+glcolorconvert", ["glupload", "glcolorconvert"]))
-                elif has_glupload:
-                    paths.insert(0, ("glupload", ["glupload"]))
 
         if pref == "auto":
             return paths
@@ -1019,21 +1160,43 @@ class GstPlayer(GObject.GObject):
                 "vadeinterlace",
                 "direct-va/dmabuf",
                 "vapostproc",
+                "vaapipostproc",
+                "direct-gl",
                 "direct-system",
+            ),
+            "gtk4": (
+                "direct-va/dmabuf",
+                "vapostproc",
+                "vaapipostproc",
+                "glupload+glcolorconvert",
+                "glupload",
+                "direct-gl",
+                "vadeinterlace+vapostproc",
             ),
             "vapostproc": (
                 "vadeinterlace+vapostproc",
                 "vapostproc",
+                "vaapipostproc",
                 "vadeinterlace",
                 "direct-va/dmabuf",
                 "glupload+glcolorconvert",
             ),
             "gl": (
                 "glupload+glcolorconvert",
+                "vapostproc+glupload+glcolorconvert",
                 "glupload",
                 "direct-gl",
                 "glcolorconvert",
                 "deinterlace+glcolorconvert",
+                "direct-va/dmabuf",
+            ),
+            "glimagesink": (
+                "glupload+glcolorconvert",
+                "vapostproc+glupload+glcolorconvert",
+                "glupload",
+                "direct-gl",
+                "glcolorconvert",
+                "direct-va/dmabuf",
             ),
             "software": (
                 "deinterlace+videoconvert",
@@ -1073,20 +1236,7 @@ class GstPlayer(GObject.GObject):
             interlaced,
         )
 
-        video_sink = _make("gtk4paintablesink", "vsink")
-        if video_sink is None:
-            logger.warning("Brak gtk4paintablesink – fakesink")
-            video_sink = _make("fakesink", "vsink")
-        else:
-            self.video_sink = video_sink
-            self._configure_live_sink(video_sink, is_video=True)
-            try:
-                paintable = video_sink.get_property("paintable")
-                self._paintable = paintable
-                self.emit("paintable-ready", paintable)
-            except Exception:
-                logger.exception("paintable")
-
+        video_sink = self._make_inner_video_sink()
         if video_sink is None:
             logger.error("brak video sink")
             return
@@ -1133,21 +1283,13 @@ class GstPlayer(GObject.GObject):
             prev = queue
             chain_ok = True
             for el in mids + [video_sink]:
-                # Wymuś system-memory na wyjściu videoconvert
-                link_caps = None
-                if el == video_sink and prev.get_factory() and prev.get_factory().get_name() == "videoconvert":
-                    link_caps = Gst.Caps.from_string("video/x-raw,format=NV12")
-                
-                if link_caps is not None:
-                    if not prev.link_filtered(el, link_caps):
-                        chain_ok = False
-                        logger.debug("link fail w ścieżce %s (filtered): %s -> %s", path_name, prev.get_name(), el.get_name())
-                        break
-                else:
-                    if not prev.link(el):
-                        chain_ok = False
-                        logger.debug("link fail w ścieżce %s: %s -> %s", path_name, prev.get_name(), el.get_name())
-                        break
+                if not prev.link(el):
+                    chain_ok = False
+                    logger.debug(
+                        "link fail w ścieżce %s: %s -> %s",
+                        path_name, prev.get_name(), el.get_name(),
+                    )
+                    break
                 prev = el
 
             if not chain_ok:
@@ -1494,56 +1636,195 @@ class GstPlayer(GObject.GObject):
             self.pipeline.set_state(Gst.State.PAUSED)
             self.emit("state-changed", "paused")
 
-    def _make_gtk4_video_sink(self) -> Optional[Gst.Element]:
-        """Bezpośrednio gtk4paintablesink, ale wymuszając DMA-copy (videoconvert).
-        Zapobiega crashom amdgpu (CS -22) przy HEVC HW."""
-        gtk_sink = _make("gtk4paintablesink", "vsink")
-        if gtk_sink is None:
-            logger.warning("Brak gtk4paintablesink – autovideosink")
-            return _make("autovideosink", "vsink")
-
-        if gtk_sink.find_property("sync") is not None:
-            try:
-                gtk_sink.set_property("sync", True)
-            except Exception:
-                pass
-        if gtk_sink.find_property("max-lateness") is not None:
-            try:
-                gtk_sink.set_property("max-lateness", int(200 * Gst.MSECOND))
-            except Exception:
-                pass
-        if gtk_sink.find_property("qos") is not None:
-            try:
-                gtk_sink.set_property("qos", True)
-            except Exception:
-                pass
-
+    def _emit_paintable_from(self, gtk_sink: Gst.Element) -> None:
         self.video_sink = gtk_sink
+        try:
+            if gtk_sink.find_property("paintable") is None:
+                return
+            paintable = gtk_sink.get_property("paintable")
+            self._paintable = paintable
+            self.emit("paintable-ready", paintable)
+        except Exception:
+            logger.exception("paintable")
 
-        # Zbuduj bin: queue ! videoconvert ! gtk4paintablesink
-        # Wymusza to DMA-copy z VA surfaces do system RAM, co zapobiega wygłodzeniu VRAM 
-        # i całkowicie omija błąd amdgpu CS -22 na Carrizo/APU.
-        bin = Gst.Bin.new("vsink_bin")
-        queue = _make("queue", "vsink_queue")
-        convert = _make("videoconvert", "vsink_convert")
-        
-        if None in (queue, convert):
+    def _make_inner_video_sink(self) -> Optional[Gst.Element]:
+        """Wewnętrzny sink do osadzenia w Gtk.Picture.
+
+        Zalecane: gtk4paintablesink (GdkPaintable, DMABuf/GLMemory).
+        Fallback: glimagesink (osobne okno GL – bez paintable).
+        """
+        pref = (self._prefs.video_output if self._prefs else "auto") or "auto"
+        gtk_sink = _make("gtk4paintablesink", "vsink")
+        if gtk_sink is not None:
+            self._configure_live_sink(gtk_sink, is_video=True)
+            try:
+                if gtk_sink.find_property("force-aspect-ratio") is not None:
+                    gtk_sink.set_property("force-aspect-ratio", False)
+            except Exception:
+                pass
+            self._emit_paintable_from(gtk_sink)
+            logger.info(
+                "Video sink inner: gtk4paintablesink (wayland=%s pref=%s)",
+                _is_wayland(), pref,
+            )
             return gtk_sink
-            
-        bin.add(queue)
-        bin.add(convert)
-        bin.add(gtk_sink)
-        
-        queue.link(convert)
-        # Wymuś system-memory na wyjściu konwertera, aby zerwać VA/DMABuf
-        caps = Gst.Caps.from_string("video/x-raw,format=NV12")
-        convert.link_filtered(gtk_sink, caps)
-        
-        sink_pad = queue.get_static_pad("sink")
+
+        if pref in ("gl", "glimagesink", "auto"):
+            glimg = _make("glimagesink", "vsink")
+            if glimg is not None:
+                self._configure_live_sink(glimg, is_video=True)
+                try:
+                    if glimg.find_property("force-aspect-ratio") is not None:
+                        glimg.set_property("force-aspect-ratio", True)
+                except Exception:
+                    pass
+                self.video_sink = glimg
+                logger.warning(
+                    "Brak gtk4paintablesink – glimagesink (osobne okno GL, "
+                    "DMABuf zero-copy przez GstGLSinkBin)"
+                )
+                return glimg
+
+        logger.warning("Brak gtk4paintablesink i glimagesink – autovideosink")
+        auto = _make("autovideosink", "vsink") or _make("fakesink", "vsink")
+        if auto is not None:
+            self._configure_live_sink(auto, is_video=True)
+            self.video_sink = auto
+        return auto
+
+    def _wrap_glsinkbin(self, inner: Gst.Element) -> Gst.Element:
+        """glsinkbin wstawia glupload: DMABuf/VAMemory → GLMemory (EGL, zero-copy).
+
+        To jest ta sama ścieżka, której używa glimagesink (glimagesink IS
+        GstGLSinkBin). Na Waylandzie glupload importuje DMA-BUF przez
+        eglCreateImageKHR(EGL_LINUX_DMA_BUF_EXT) – bez kopii przez CPU.
+        """
+        glbin = _make("glsinkbin", "glsinkbin")
+        if glbin is None:
+            logger.warning("Brak glsinkbin – sink bez automatycznego glupload")
+            return inner
+        try:
+            glbin.set_property("sink", inner)
+        except Exception:
+            logger.exception("glsinkbin.sink")
+            return inner
+        try:
+            if glbin.find_property("sync") is not None:
+                glbin.set_property("sync", True)
+            if glbin.find_property("qos") is not None:
+                glbin.set_property("qos", True)
+        except Exception:
+            pass
+        inner_name = inner.get_factory().get_name() if inner.get_factory() else "?"
+        logger.info(
+            "glsinkbin wrap: DMABuf/VAMemory → glupload → %s (wayland=%s, zero-copy)",
+            inner_name, _is_wayland(),
+        )
+        return glbin
+
+    def _make_bin_with_filters(
+        self, name: str, filters: List[str], inner: Gst.Element
+    ) -> Optional[Gst.Element]:
+        """Bin: ghost_sink → filter… → inner. Filtry GPU (vapostproc/glupload)
+        zachowują zero-copy; videoconvert – kopia CPU."""
+        elements = []
+        for i, fname in enumerate(filters):
+            el = _make(fname, f"{name}_{fname}_{i}")
+            if el is None:
+                return None
+            if fname == "vapostproc" and el.find_property("deinterlace-mode") is not None:
+                try:
+                    el.set_property("deinterlace-mode", "auto")
+                except Exception:
+                    pass
+            elements.append(el)
+        bin_el = Gst.Bin.new(name)
+        for el in elements:
+            bin_el.add(el)
+        parent = inner.get_parent()
+        if parent is not None:
+            try:
+                parent.remove(inner)
+            except Exception:
+                pass
+        bin_el.add(inner)
+        prev = elements[0]
+        for el in elements[1:] + [inner]:
+            if not prev.link(el):
+                logger.warning("sink bin link fail: %s -> %s", prev.get_name(), el.get_name())
+                return None
+            prev = el
+        sink_pad = elements[0].get_static_pad("sink")
+        if sink_pad is None:
+            return None
         ghost = Gst.GhostPad.new("sink", sink_pad)
-        bin.add_pad(ghost)
-        
-        return bin
+        bin_el.add_pad(ghost)
+        return bin_el
+
+    def _make_playbin_video_sink(self) -> Optional[Gst.Element]:
+        """Video-sink dla playbin – zero-copy na Wayland gdy wybrane z opcji.
+
+        auto / gtk4 (zalecane):
+            glsinkbin sink=gtk4paintablesink
+            va*dec → DMABuf → glupload (EGL) → gtk4paintablesink → Gtk.Picture
+        gl / glimagesink (zalecane):
+            ta sama ścieżka GL (glimagesink to GstGLSinkBin); osadzamy
+            gtk4paintablesink, żeby obraz został w oknie GTK4.
+            Gdy brak gtk4paintablesink → prawdziwy glimagesink.
+        va-surface:
+            gtk4paintablesink bezpośrednio (GDK importuje DMABuf).
+        vapostproc:
+            vapostproc ! gtk4paintablesink  (konwersja po stronie GPU).
+        software:
+            videoconvert ! gtk4paintablesink  (kopia CPU, ostatnia deska).
+        """
+        pref = (self._prefs.video_output if self._prefs else "auto") or "auto"
+        inner = self._make_inner_video_sink()
+        if inner is None:
+            return None
+
+        inner_name = inner.get_factory().get_name() if inner.get_factory() else "?"
+        wayland = _is_wayland()
+
+        if pref == "software":
+            bin_el = self._make_bin_with_filters(
+                "vsink_copy", ["videoconvert"], inner
+            )
+            logger.info("video-sink: videoconvert ! %s (kopia CPU)", inner_name)
+            return bin_el or inner
+
+        if pref == "vapostproc":
+            for filt in (["vapostproc"], ["vaapipostproc"]):
+                bin_el = self._make_bin_with_filters("vsink_vapost", filt, inner)
+                if bin_el is not None:
+                    logger.info(
+                        "video-sink: %s ! %s (GPU, zero-copy)", filt[0], inner_name
+                    )
+                    return bin_el
+            logger.warning("Brak vapostproc/vaapipostproc – fallback glsinkbin")
+            return self._wrap_glsinkbin(inner)
+
+        if pref == "va-surface":
+            logger.info(
+                "video-sink: %s direct (VA/DMABuf → GDK, wayland=%s)",
+                inner_name, wayland,
+            )
+            return inner
+
+        if pref in ("gl", "glimagesink"):
+            # glimagesink sam jest GstGLSinkBin. Gdy mamy gtk4paintablesink,
+            # owijamy go w glsinkbin – identyczna ścieżka GL, obraz w GTK4.
+            if inner_name == "glimagesink":
+                logger.info("video-sink: glimagesink (GstGLSinkBin, DMABuf zero-copy)")
+                return inner
+            return self._wrap_glsinkbin(inner)
+
+        # auto / gtk4: na Waylandzie glsinkbin, żeby VA DMABuf zawsze
+        # wszedł przez EGL import. gtk4paintablesink sam też umie DMABuf,
+        # ale glupload jest pewniejszy wobec VAMemory z vaapi*dec.
+        if wayland or pref == "gtk4":
+            return self._wrap_glsinkbin(inner)
+        return inner
 
     def play_http_ts(self, uri: str) -> None:
         self.stop()
@@ -1562,7 +1843,7 @@ class GstPlayer(GObject.GObject):
             logger.error("Brak playbin/playbin3")
             return
 
-        video_sink = self._make_gtk4_video_sink()
+        video_sink = self._make_playbin_video_sink()
         audio_sink = _make("autoaudiosink", "asink") or _make("fakesink", "asink")
 
         if video_sink is not None:
@@ -1658,10 +1939,15 @@ class GstPlayer(GObject.GObject):
             pass
 
         ret = playbin.set_state(Gst.State.PLAYING)
+        vout = (self._prefs.video_output if self._prefs else "auto") or "auto"
         logger.info(
-            "HTTP TS playbin: uri=%s state=%s vsink=gtk4paintablesink+dma_copy",
+            "HTTP TS playbin: uri=%s state=%s decoder=%s vsink=%s wayland=%s zerocopy=%s",
             uri.split("?")[0],
             ret,
+            pref,
+            vout,
+            _is_wayland(),
+            vout in _ZEROCOPY_OUTPUTS,
         )
         self.emit("state-changed", "playing")
         self._start_watchdog()
@@ -2205,8 +2491,18 @@ class GstPlayer(GObject.GObject):
         if not self.pipeline:
             return
         found = []
+        hw_dec = None
+        sw_dec = None
+        has_videoconvert = False
+        has_glupload = False
+        has_vapost = False
+        has_gtk4 = False
+        has_glimg = False
+        has_glsinkbin = False
 
         def _walk(el, prefix=""):
+            nonlocal hw_dec, sw_dec, has_videoconvert, has_glupload
+            nonlocal has_vapost, has_gtk4, has_glimg, has_glsinkbin
             name = el.get_name()
             factory = el.get_factory()
             fname = factory.get_name() if factory else type(el).__name__
@@ -2216,10 +2512,29 @@ class GstPlayer(GObject.GObject):
                 for k in (
                     "dec", "parse", "demux", "sink", "src", "convert",
                     "va", "avdec", "tsdemux", "soup", "queue", "paint",
+                    "glupload", "glcolor", "glimage", "glsink",
                 )
             )
             if interesting:
                 found.append(f"{prefix}{fname}:{name}")
+            fl = fname.lower()
+            if fl.startswith(("va", "vaapi")) and "dec" in fl:
+                hw_dec = fname
+            elif fl.startswith("avdec_") or fl in ("openh264dec", "libde265dec", "jpegdec"):
+                if "h264" in fl or "h265" in fl or "mpeg" in fl or "vp" in fl or "jpeg" in fl or "vc1" in fl or "wmv" in fl or "av1" in fl:
+                    sw_dec = fname
+            if fl == "videoconvert":
+                has_videoconvert = True
+            if fl == "glupload":
+                has_glupload = True
+            if fl in ("vapostproc", "vaapipostproc"):
+                has_vapost = True
+            if fl == "gtk4paintablesink":
+                has_gtk4 = True
+            if fl == "glimagesink":
+                has_glimg = True
+            if fl == "glsinkbin":
+                has_glsinkbin = True
             if isinstance(el, Gst.Bin):
                 it = el.iterate_elements()
                 while True:
@@ -2236,6 +2551,22 @@ class GstPlayer(GObject.GObject):
             logger.info("Pipeline elements:\n  %s", "\n  ".join(found))
         else:
             logger.info("Pipeline elements: (brak / jeszcze nie zlinkowane)")
+
+        zerocopy = bool(hw_dec) and not has_videoconvert and (
+            has_glupload or has_vapost or has_glsinkbin or has_gtk4 or has_glimg
+        )
+        logger.info(
+            "Pipeline path: hw_dec=%s sw_dec=%s gtk4=%s glimagesink=%s "
+            "glsinkbin=%s glupload=%s vapostproc=%s videoconvert=%s "
+            "zerocopy=%s wayland=%s",
+            hw_dec, sw_dec, has_gtk4, has_glimg, has_glsinkbin,
+            has_glupload, has_vapost, has_videoconvert,
+            zerocopy, _is_wayland(),
+        )
+        if hw_dec:
+            self.emit("decoder-chosen", hw_dec, "vaapi")
+        elif sw_dec:
+            self.emit("decoder-chosen", sw_dec, "software")
 
     def _on_bus_message(self, _bus, message: Gst.Message) -> None:
         t = message.type
