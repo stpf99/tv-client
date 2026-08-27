@@ -93,6 +93,10 @@ class PlayerPreferences:
         preferred_sub_langs: Optional[List[str]] = None,
         subtitles_enabled: bool = True,
         subtitle_font_pt: int = 20,
+        osd_subtitle_font_pt: int = 16,
+        osd_desc_autoscroll: bool = False,
+        osd_desc_scroll_direction: str = "down",
+        osd_top_bar_font_pt: int = 20,
     ):
         self.decoder_pref = decoder_pref if decoder_pref in ("auto", "hw", "sw") else "auto"
         self.video_output = (
@@ -107,6 +111,18 @@ class PlayerPreferences:
         # Dotyczy tylko napisow tekstowych (TEXTSUB/teletekst) - DVBSUB to
         # bitmapa i nie skaluje sie przez font.
         self.subtitle_font_pt = int(subtitle_font_pt) if subtitle_font_pt else 20
+        # Odrebne ustawienia dla warstwy OSD (nakladka GTK, nie dekoder):
+        # rozmiar czcionki opisu audycji w dolnej belce OSD, oraz
+        # automatyczne przewijanie dlugiego opisu (i jego kierunek), gdy
+        # tekst nie miesci sie w widocznym obszarze.
+        self.osd_subtitle_font_pt = int(osd_subtitle_font_pt) if osd_subtitle_font_pt else 16
+        self.osd_desc_autoscroll = bool(osd_desc_autoscroll)
+        self.osd_desc_scroll_direction = (
+            osd_desc_scroll_direction if osd_desc_scroll_direction in ("up", "down") else "down"
+        )
+        # Rozmiar czcionki gornego paska OSD (nazwa kanalu + zegar) -
+        # domyslny title-2 z libadwaita bywa za maly na duzym ekranie/TV.
+        self.osd_top_bar_font_pt = int(osd_top_bar_font_pt) if osd_top_bar_font_pt else 20
 
     def to_dict(self) -> dict:
         return {
@@ -116,6 +132,10 @@ class PlayerPreferences:
             "preferred_sub_langs": self.preferred_sub_langs,
             "subtitles_enabled": self.subtitles_enabled,
             "subtitle_font_pt": self.subtitle_font_pt,
+            "osd_subtitle_font_pt": self.osd_subtitle_font_pt,
+            "osd_desc_autoscroll": self.osd_desc_autoscroll,
+            "osd_desc_scroll_direction": self.osd_desc_scroll_direction,
+            "osd_top_bar_font_pt": self.osd_top_bar_font_pt,
         }
 
     @classmethod
@@ -127,6 +147,10 @@ class PlayerPreferences:
             preferred_sub_langs=d.get("preferred_sub_langs"),
             subtitles_enabled=d.get("subtitles_enabled", True),
             subtitle_font_pt=d.get("subtitle_font_pt", 20),
+            osd_subtitle_font_pt=d.get("osd_subtitle_font_pt", 16),
+            osd_desc_autoscroll=d.get("osd_desc_autoscroll", False),
+            osd_desc_scroll_direction=d.get("osd_desc_scroll_direction", "down"),
+            osd_top_bar_font_pt=d.get("osd_top_bar_font_pt", 20),
         )
 
     def rank_language(self, lang: Optional[str], preferred: List[str]) -> int:

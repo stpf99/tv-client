@@ -323,6 +323,34 @@ class TvhLibrary(GObject.GObject):
     def unsubscribe(self, subscription_id: int) -> None:
         bridge.call(self.client.unsubscribe(subscription_id))
 
+    def resolve_icon_url(self, raw: Optional[str]) -> Optional[str]:
+        """Zamienia surowa wartosc channelIcon/tagIcon z HTSP na absolutny URL.
+
+        TVH zwraca zazwyczaj sciezke wzgledna (np. "imagecache/123") albo
+        czasem juz gotowy http(s):// URL, a bywa tez picon:// (nieobslugiwane
+        tutaj - brak sensownego mapowania bez lokalnej bazy picon). Zwraca
+        None gdy nie da sie zbudowac uzytecznego URL.
+        """
+        if not raw:
+            return None
+        raw = raw.strip()
+        if not raw:
+            return None
+        if raw.startswith("http://") or raw.startswith("https://"):
+            return raw
+        if raw.startswith("picon://"):
+            return None
+        host = self.host or "127.0.0.1"
+        http_port = getattr(self, "http_port", None) or 9981
+        user = self.username or ""
+        password = self.password or ""
+        path = raw if raw.startswith("/") else f"/{raw}"
+        auth = ""
+        if user:
+            from urllib.parse import quote
+            auth = f"{quote(user, safe='')}:{quote(password, safe='')}@"
+        return f"http://{auth}{host}:{http_port}{path}"
+
     def get_http_stream_url(
         self,
         channel_id: int,
@@ -399,6 +427,48 @@ class TvhLibrary(GObject.GObject):
             self.client.get_dvr_configs(),
             _ok,
             lambda e: logger.error("getDvrConfigs: %s", e),
+        )
+
+    def search_epg(
+        self,
+        query: str,
+        on_ok: Callable[[list], None],
+        on_err: Optional[Callable[[Exception], None]] = None,
+        channel_id: Optional[int] = None,
+        limit: int = 50,
+    ) -> None:
+        """Przeszukuje EPG na serwerze (epgQuery – pelnotekstowe, poza
+        oknem zsynchronizowanych zdarzen w pamieci klienta).
+
+        epgQuery zwraca tylko `eventIds`; dla kazdego ID, ktorego nie mamy
+        juz w cache (`self.events`), dociagamy pelne dane przez getEvents.
+        Wynik: lista EpgEvent posortowana po czasie startu (rosnaco).
+        """
+        async def _run() -> list:
+            resp = await self.client.epg_query(query, channel_id=channel_id, limit=limit)
+            ids = resp.get("eventIds") or []
+            out: list = []
+            for eid in ids:
+                cached = self.events.get(eid)
+                if cached is not None:
+                    out.append(cached)
+                    continue
+                try:
+                    ev_resp = await self.client.get_events(event_id=eid, num_following=0)
+                except Exception:
+                    continue
+                events_raw = ev_resp.get("events") or ([ev_resp] if ev_resp.get("eventId") else [])
+                for m in events_raw:
+                    if m.get("eventId") == eid or m.get("eventId") is None:
+                        out.append(EpgEvent.from_htsp(m))
+                        break
+            out.sort(key=lambda e: e.start)
+            return out
+
+        bridge.call_with_callback(
+            _run(),
+            on_ok,
+            (lambda e: logger.error("epgQuery: %s", e)) if on_err is None else on_err,
         )
 
     def record_event(self, channel_id: int, event_id: int) -> None:

@@ -95,6 +95,7 @@ class EpgEvent:
     # pola pomocnicze do PVR / serii
     series_link_id: Optional[int] = None
     episode_id: Optional[str] = None
+    content_type: Optional[int] = None  # DVB genre code z HTSP "contentType"
 
     @classmethod
     def from_htsp(cls, m: dict) -> "EpgEvent":
@@ -139,6 +140,7 @@ class EpgEvent:
             start, stop = 0, 0
 
         nxt = m.get("nextEventId")
+        ct = m.get("contentType")
         return cls(
             event_id=_ts(m.get("eventId")),
             channel_id=_ts(m.get("channelId")),
@@ -150,6 +152,7 @@ class EpgEvent:
             next_event_id=int(nxt) if nxt else None,
             series_link_id=m.get("seriesLinkId") or m.get("serieslinkId"),
             episode_id=m.get("episodeId") or m.get("episodeNumber"),
+            content_type=int(ct) if ct is not None else None,
         )
 
 
