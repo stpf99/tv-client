@@ -476,6 +476,16 @@ class GstPlayer(GObject.GObject):
 
     def __init__(self) -> None:
         super().__init__()
+        # Generacja pipeline'u - inkrementowana przy kazdym stop()/nowym
+        # starcie. Bus starego pipeline'u nie jest natychmiast odlaczany
+        # (add_signal_watch/connect bez pary remove_signal_watch/disconnect),
+        # wiec przy szybkiej zmianie kanalu potrafi jeszcze dostarczyc
+        # spozniony EOS/ERROR/STATE_CHANGED z NIEISTNIEJACEGO juz pipeline'u
+        # DLUGO PO tym jak nowy kanal juz gra. _on_bus_message dostaje wlasna
+        # generacje w domknieciu i odrzuca wiadomosci nie pasujace do
+        # aktualnej - to jest zrodlo losowo znikajacej nazwy kanalu/OSD
+        # (spozniony EOS/ERROR nadpisywal etykiete tytulu nowego kanalu).
+        self._generation: int = 0
         self.pipeline: Optional[Gst.Pipeline] = None
         self.appsrc_video: Optional[GstApp.AppSrc] = None
         self.appsrc_audio: Optional[GstApp.AppSrc] = None
@@ -579,9 +589,12 @@ class GstPlayer(GObject.GObject):
         pipeline = Gst.Pipeline.new("tvh-player")
         self.pipeline = pipeline
         self._http_mode = False
+        self._generation += 1
+        gen = self._generation
         bus = pipeline.get_bus()
+        self._bus = bus
         bus.add_signal_watch()
-        bus.connect("message", self._on_bus_message)
+        bus.connect("message", self._on_bus_message, gen)
 
         if video_type:
             caps_str = VIDEO_CAPS.get(video_type)
@@ -1929,9 +1942,12 @@ class GstPlayer(GObject.GObject):
             pass
         self._apply_subtitle_font_pt()
 
+        self._generation += 1
+        gen = self._generation
         bus = playbin.get_bus()
+        self._bus = bus
         bus.add_signal_watch()
-        bus.connect("message", self._on_bus_message)
+        bus.connect("message", self._on_bus_message, gen)
 
         try:
             playbin.set_start_time(Gst.CLOCK_TIME_NONE)
@@ -1955,6 +1971,18 @@ class GstPlayer(GObject.GObject):
 
     def stop(self) -> None:
         self._stop_watchdog()
+        # Odetnij bus PRZED zatrzymaniem pipeline'u, zeby zaden spozniony
+        # EOS/ERROR/STATE_CHANGED z tego pipeline'u nie mogl juz dotrzec do
+        # _on_bus_message (dodatkowo strzezone generacja, ale to eliminuje
+        # zrodlo calkowicie zamiast tylko je filtrowac).
+        old_bus = getattr(self, "_bus", None)
+        if old_bus is not None:
+            try:
+                old_bus.remove_signal_watch()
+            except Exception:
+                pass
+            self._bus = None
+        self._generation += 1
         pipeline = None
         with self._push_lock:
             if self.pipeline:
@@ -2568,7 +2596,15 @@ class GstPlayer(GObject.GObject):
         elif sw_dec:
             self.emit("decoder-chosen", sw_dec, "software")
 
-    def _on_bus_message(self, _bus, message: Gst.Message) -> None:
+    def _on_bus_message(self, _bus, message: Gst.Message, gen: int) -> None:
+        # Bus starego pipeline'u nie jest odlaczany synchronicznie ze stop()
+        # (patrz komentarz w __init__), wiec przy szybkiej zmianie kanalu
+        # potrafi jeszcze wyemitowac spozniony EOS/ERROR/STATE_CHANGED z
+        # nieaktualnej juz generacji - to nadpisywalo etykiety nowego
+        # kanalu (losowo znikajaca nazwa/OSD). Odrzucamy wszystko co nie
+        # nalezy do biezacej generacji, zanim zrobimy cokolwiek innego.
+        if gen != self._generation:
+            return
         t = message.type
         if t == Gst.MessageType.ERROR:
             err, debug = message.parse_error()
