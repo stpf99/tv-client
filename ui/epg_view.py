@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 from datetime import datetime, date
+from typing import Optional
 
 import gi
 
@@ -12,6 +13,7 @@ from gi.repository import Gtk, Adw, Pango, GLib  # noqa: E402
 
 from tvh.library import TvhLibrary
 from tvh.models import EpgEvent
+from ui.epg_search import EpgQuery, parse_query
 
 
 def _fmt_range(start: int, stop: int, now_ts: int | None = None) -> str:
@@ -169,7 +171,7 @@ class EpgChannelRow(Gtk.ListBoxRow):
         super().__init__()
         self.library = library
         self.channel_id = channel_id
-
+        self.channel_name = channel_name
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         box.set_margin_top(10)
         box.set_margin_bottom(10)
@@ -192,7 +194,10 @@ class EpgChannelRow(Gtk.ListBoxRow):
         self.set_child(box)
         self.refresh()
 
-    def refresh(self) -> None:
+    def refresh(self, query: Optional[EpgQuery] = None) -> bool:
+        """Odswieza wiersz kanalu. Zwraca True, jesli kanal ma cokolwiek
+        do pokazania (przy aktywnym query - czy jakikolwiek program
+        pasuje do wyszukiwania), False gdy wiersz nalezy ukryc."""
         # wyczyść poprzednie wiersze programów
         while (child := self.events_box.get_first_child()) is not None:
             self.events_box.remove(child)
@@ -210,6 +215,34 @@ class EpgChannelRow(Gtk.ListBoxRow):
         events = [
             e for e in self.library.events_by_channel.get(self.channel_id, []) if _sane(e)
         ]
+
+        has_query = query is not None and not query.is_empty
+        if has_query:
+            events = [e for e in events if query.matches(e, self.channel_name, now)]
+            if not events:
+                return False
+            # przy aktywnym wyszukiwaniu pokazujemy dopasowane programy
+            # chronologicznie, bez sztucznego dzielenia na TERAZ/NASTĘPNIE
+            events.sort(key=lambda e: e.start)
+            shown = events[: self.MAX_EVENTS]
+            tags = [""] * len(shown)
+            is_curr = [
+                e.start <= now < e.stop for e in shown
+            ]
+            if shown:
+                self.day_hint.set_text(_day_label(shown[0].start, now))
+            else:
+                self.day_hint.set_text("")
+            for i, ev in enumerate(shown):
+                row = EpgEventRow(
+                    self.library,
+                    self.channel_id,
+                    ev,
+                    tag=tags[i] if i < len(tags) else "",
+                    is_current=is_curr[i] if i < len(is_curr) else False,
+                )
+                self.events_box.append(row)
+            return True
 
         # Aktualny program: eventId + weryfikacja start/stop vs time.time()
         current = self.library.current_event_for_channel(self.channel_id, now)
@@ -236,7 +269,7 @@ class EpgChannelRow(Gtk.ListBoxRow):
                 empty.add_css_class("caption")
                 self.events_box.append(empty)
                 self.day_hint.set_text("")
-                return
+                return True
             shown = upcoming
             tags = ["NASTĘPNIE"] + [""] * (len(shown) - 1)
             is_curr = [False] * len(shown)
@@ -262,7 +295,7 @@ class EpgChannelRow(Gtk.ListBoxRow):
                 is_current=is_curr[i] if i < len(is_curr) else False,
             )
             self.events_box.append(row)
-
+        return True
 
 class EpgView(Gtk.Box):
     """Przewodnik: lista kanałów z sąsiadującymi programami (gazeta EPG),
@@ -272,21 +305,28 @@ class EpgView(Gtk.Box):
     def __init__(self, library: TvhLibrary) -> None:
         super().__init__(orientation=Gtk.Orientation.VERTICAL)
         self.library = library
+        self._query: Optional[EpgQuery] = None
 
-        # pasek narzędzi: filtr / odśwież
+        # pasek narzędzi: wyszukiwarka / odśwież
         toolbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         toolbar.set_margin_top(6)
         toolbar.set_margin_bottom(4)
         toolbar.set_margin_start(12)
         toolbar.set_margin_end(12)
-        hint = Gtk.Label(
-            label="Widok gazetowy · data przy programach spoza dziś · 24h",
-            xalign=0,
-            hexpand=True,
+
+        self.search_entry = Gtk.SearchEntry()
+        self.search_entry.set_hexpand(True)
+        self.search_entry.set_placeholder_text(
+            "Szukaj: tytuł, opis, kanał, gatunek (film, sport…), data (12.08, jutro), godzina (20:00-22:00, po 20)"
         )
-        hint.add_css_class("caption")
-        hint.add_css_class("dim-label")
-        toolbar.append(hint)
+        self.search_entry.connect("search-changed", self._on_search_changed)
+        toolbar.append(self.search_entry)
+
+        self.results_hint = Gtk.Label(xalign=1)
+        self.results_hint.add_css_class("caption")
+        self.results_hint.add_css_class("dim-label")
+        toolbar.append(self.results_hint)
+
         refresh_btn = Gtk.Button(icon_name="view-refresh-symbolic")
         refresh_btn.add_css_class("flat")
         refresh_btn.set_tooltip_text("Odśwież widok EPG")
@@ -312,24 +352,50 @@ class EpgView(Gtk.Box):
         # okresowe odświeżenie „TERAZ” (co 60 s)
         GLib.timeout_add_seconds(60, self._tick)
 
+    def _on_search_changed(self, entry: Gtk.SearchEntry) -> None:
+        text = (entry.get_text() or "").strip()
+        self._query = parse_query(text) if text else None
+        self.reload()
+
     def _tick(self) -> bool:
+        query = self._query
         i = 0
         while (row := self.listbox.get_row_at_index(i)) is not None:
             if isinstance(row, EpgChannelRow):
-                row.refresh()
+                row.refresh(query)
             i += 1
         return True
 
     def reload(self) -> None:
         while (row := self.listbox.get_row_at_index(0)) is not None:
             self.listbox.remove(row)
+
+        query = self._query
+        has_query = query is not None and not query.is_empty
+        shown = 0
+
         for ch in self.library.tv_channels() + self.library.radio_channels():
-            self.listbox.append(EpgChannelRow(self.library, ch.channel_id, ch.name))
+            row = EpgChannelRow(self.library, ch.channel_id, ch.name)
+            if has_query:
+                if not row.refresh(query):
+                    continue
+            self.listbox.append(row)
+            shown += 1
+
+        if has_query:
+            self.results_hint.set_text(
+                f"{shown} kanał" if shown == 1 else f"{shown} kanałów" if shown else "Brak wyników"
+            )
+        else:
+            self.results_hint.set_text("")
 
     def _refresh_channel(self, channel_id: int) -> None:
+        query = self._query
         i = 0
         while (row := self.listbox.get_row_at_index(i)) is not None:
             if isinstance(row, EpgChannelRow) and row.channel_id == channel_id:
-                row.refresh()
+                visible = row.refresh(query)
+                if query is not None and not query.is_empty and not visible:
+                    self.listbox.remove(row)
                 break
             i += 1

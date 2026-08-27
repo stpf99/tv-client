@@ -11,10 +11,11 @@ from gi.repository import Gtk, Adw  # noqa: E402
 
 from tvh.library import TvhLibrary
 from ui.recent import RecentEntry, RecentStore
+from ui.icon_cache import make_icon_widget
 
 
 class RecentTile(Gtk.Button):
-    def __init__(self, entry: RecentEntry, on_activate: Callable[[int], None]) -> None:
+    def __init__(self, entry: RecentEntry, library: TvhLibrary, on_activate: Callable[[int], None]) -> None:
         super().__init__()
         self.add_css_class("tvh-recent-tile")
         self.add_css_class("card")
@@ -26,8 +27,7 @@ class RecentTile(Gtk.Button):
         box.set_margin_start(10)
         box.set_margin_end(10)
 
-        icon = Gtk.Image.new_from_icon_name("tv-symbolic")
-        icon.set_pixel_size(40)
+        icon = make_icon_widget("tv-symbolic", 60, library.resolve_icon_url(entry.icon_url))
         icon.set_vexpand(True)
         box.append(icon)
 
@@ -87,5 +87,5 @@ class RecentView(Gtk.Box):
             child = nxt
         items = self.recent_store.items
         for entry in items:
-            self.flow.append(RecentTile(entry, self.on_play_channel_id))
+            self.flow.append(RecentTile(entry, self.library, self.on_play_channel_id))
         self.stack.set_visible_child_name("grid" if items else "empty")

@@ -58,6 +58,10 @@
   transition: opacity 250ms ease;
 }
 
+.tvh-osd-top {
+  min-height: 48px;
+}
+
 .tvh-osd-bottom {
   background: linear-gradient(
     to top,

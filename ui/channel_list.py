@@ -12,6 +12,7 @@ from gi.repository import Gtk, Pango  # noqa: E402
 from tvh.library import TvhLibrary
 from tvh.models import Channel
 from tvh.config import is_favorite, toggle_favorite
+from ui.icon_cache import make_icon_widget
 
 FAV_TAG = "__favorites__"  # sentinel dla wirtualnego "tagu" Ulubione w chipach
 
@@ -34,8 +35,11 @@ class ChannelRow(Gtk.ListBoxRow):
         number_lbl.set_width_chars(4)
         box.append(number_lbl)
 
-        icon = Gtk.Image.new_from_icon_name("tv-symbolic" if not channel.is_radio else "audio-input-microphone-symbolic")
-        icon.set_pixel_size(28)
+        icon = make_icon_widget(
+            "tv-symbolic" if not channel.is_radio else "audio-input-microphone-symbolic",
+            42,
+            library.resolve_icon_url(channel.icon_url),
+        )
         box.append(icon)
 
         # Kolumna tekstowa MUSI miec ograniczona/elastyczna szerokosc i

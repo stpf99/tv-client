@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from datetime import datetime
 from pathlib import Path
 from urllib.request import urlretrieve, Request, urlopen
@@ -213,6 +214,143 @@ class RecordingRow(Gtk.ListBoxRow):
             self.library.delete_recording(self.rec.entry_id)
 
 
+class NewRecordingDialog(Adw.Window):
+    """Zaplanuj nowe nagranie: wybor kanalu Z LISTY (nie recznie wpisywana
+    nazwa), tytul i okno czasowe. Adw.ComboRow z duza lista kanalow ma
+    wbudowane wyszukiwanie typeahead (GTK >= 4.10) - wpisanie liter
+    filtruje/skacze do pasujacej pozycji tak jak w innych ComboRow tej
+    aplikacji (patrz connection_dialog.py, live_view.py prefs)."""
+
+    def __init__(self, parent: Gtk.Window, library: TvhLibrary) -> None:
+        super().__init__(transient_for=parent, modal=True, title="Nowe nagranie")
+        self.library = library
+        self.saved = False
+        self.set_default_size(440, 420)
+
+        toolbar_view = Adw.ToolbarView()
+        header = Adw.HeaderBar()
+        header.set_show_end_title_buttons(False)
+        cancel_btn = Gtk.Button(label="Anuluj")
+        cancel_btn.connect("clicked", lambda *_: self.close())
+        header.pack_start(cancel_btn)
+        self.save_btn = Gtk.Button(label="Zaplanuj")
+        self.save_btn.add_css_class("suggested-action")
+        self.save_btn.connect("clicked", self._on_save)
+        self.save_btn.set_sensitive(False)
+        header.pack_end(self.save_btn)
+        toolbar_view.add_top_bar(header)
+
+        page = Adw.PreferencesPage()
+
+        group = Adw.PreferencesGroup(title="Kanał i tytuł")
+        page.add(group)
+
+        self._channels = library.tv_channels() + library.radio_channels()
+        names = [f"{c.number or '—'}  {c.name}" for c in self._channels]
+        self.channel_row = Adw.ComboRow(title="Kanał")
+        self.channel_row.set_model(Gtk.StringList.new(names))
+        # Wyszukiwanie w ComboRow wymaga ustawienia 'expression' (od czego
+        # brac tekst do filtrowania) - bez tego enable_search nic nie
+        # zrobi. Wymaga libadwaita >= 1.4; na starszych wersjach po prostu
+        # nie bedzie pola wyszukiwania w popupie, reszta dziala normalnie.
+        try:
+            self.channel_row.set_expression(
+                Gtk.PropertyExpression.new(Gtk.StringObject, None, "string")
+            )
+            self.channel_row.set_enable_search(True)
+        except (AttributeError, TypeError):
+            logger.debug("Adw.ComboRow.set_enable_search niedostępne w tej wersji libadwaita")
+        self.channel_row.connect("notify::selected", self._on_channel_changed)
+        group.add(self.channel_row)
+
+        self.title_entry = Adw.EntryRow(title="Tytuł nagrania")
+        group.add(self.title_entry)
+
+        group_time = Adw.PreferencesGroup(title="Okno czasowe")
+        page.add(group_time)
+
+        now = int(time.time())
+        default_start = now + 60
+        default_stop = now + 3600
+
+        self.date_row = Adw.EntryRow(title="Data (RRRR-MM-DD)")
+        self.date_row.set_text(datetime.fromtimestamp(default_start).strftime("%Y-%m-%d"))
+        group_time.add(self.date_row)
+
+        self.start_row = Adw.EntryRow(title="Początek (GG:MM)")
+        self.start_row.set_text(datetime.fromtimestamp(default_start).strftime("%H:%M"))
+        group_time.add(self.start_row)
+
+        self.stop_row = Adw.EntryRow(title="Koniec (GG:MM)")
+        self.stop_row.set_text(datetime.fromtimestamp(default_stop).strftime("%H:%M"))
+        group_time.add(self.stop_row)
+
+        self.error_lbl = Gtk.Label(xalign=0, wrap=True)
+        self.error_lbl.add_css_class("error")
+        self.error_lbl.set_visible(False)
+        self.error_lbl.set_margin_start(12)
+        self.error_lbl.set_margin_end(12)
+        page.add(self._wrap_error())
+
+        toolbar_view.set_content(page)
+        self.set_content(toolbar_view)
+
+        if self._channels:
+            self.channel_row.set_selected(0)
+
+    def _wrap_error(self) -> Adw.PreferencesGroup:
+        g = Adw.PreferencesGroup()
+        g.add(self.error_lbl)
+        return g
+
+    def _on_channel_changed(self, *_a) -> None:
+        idx = self.channel_row.get_selected()
+        if 0 <= idx < len(self._channels) and not self.title_entry.get_text():
+            ch = self._channels[idx]
+            ev = self.library.current_event_for_channel(ch.channel_id, int(time.time()))
+            if ev and ev.title:
+                self.title_entry.set_text(ev.title)
+        self.save_btn.set_sensitive(bool(self._channels))
+
+    def _parse_window(self) -> tuple[int, int] | None:
+        try:
+            d = datetime.strptime(self.date_row.get_text().strip(), "%Y-%m-%d")
+            t0 = datetime.strptime(self.start_row.get_text().strip(), "%H:%M")
+            t1 = datetime.strptime(self.stop_row.get_text().strip(), "%H:%M")
+        except ValueError:
+            self.error_lbl.set_text("Nieprawidłowy format daty lub godziny.")
+            self.error_lbl.set_visible(True)
+            return None
+        start_dt = d.replace(hour=t0.hour, minute=t0.minute)
+        stop_dt = d.replace(hour=t1.hour, minute=t1.minute)
+        if stop_dt <= start_dt:
+            # okno przechodzace przez polnoc (np. 23:50 -> 00:40)
+            from datetime import timedelta
+            stop_dt += timedelta(days=1)
+        start = int(start_dt.timestamp())
+        stop = int(stop_dt.timestamp())
+        if stop <= start:
+            self.error_lbl.set_text("Koniec musi być późniejszy niż początek.")
+            self.error_lbl.set_visible(True)
+            return None
+        self.error_lbl.set_visible(False)
+        return start, stop
+
+    def _on_save(self, *_a) -> None:
+        idx = self.channel_row.get_selected()
+        if not (0 <= idx < len(self._channels)):
+            return
+        window = self._parse_window()
+        if window is None:
+            return
+        start, stop = window
+        ch = self._channels[idx]
+        title = self.title_entry.get_text().strip() or ch.name
+        self.library.record_manual(channel_id=ch.channel_id, title=title, start=start, stop=stop)
+        self.saved = True
+        self.close()
+
+
 class RecordingsView(Gtk.Box):
     """Osobna karta/index nagrań: co i kiedy, play, archiwizuj, pobierz, usuń z serwera."""
 
@@ -231,6 +369,12 @@ class RecordingsView(Gtk.Box):
         title = Gtk.Label(label="Nagrania DVR", xalign=0, hexpand=True)
         title.add_css_class("title-3")
         header.append(title)
+        new_rec_btn = Gtk.Button(label="Nowe nagranie")
+        new_rec_btn.set_icon_name("list-add-symbolic")
+        new_rec_btn.add_css_class("suggested-action")
+        new_rec_btn.set_tooltip_text("Zaplanuj nagranie wybierając kanał z listy")
+        new_rec_btn.connect("clicked", self._on_new_recording)
+        header.append(new_rec_btn)
         open_local = Gtk.Button(label="Folder lokalny")
         open_local.set_icon_name("folder-symbolic")
         open_local.set_tooltip_text(str(LOCAL_ARCHIVE_DIR))
@@ -274,6 +418,14 @@ class RecordingsView(Gtk.Box):
     def _open_local_folder(self, *_a) -> None:
         LOCAL_ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
         Gio.AppInfo.launch_default_for_uri(LOCAL_ARCHIVE_DIR.as_uri(), None)
+
+    def _on_new_recording(self, *_a) -> None:
+        if not self.library.tv_channels() and not self.library.radio_channels():
+            self._toast("Lista kanałów jeszcze się nie załadowała — spróbuj ponownie za chwilę.")
+            return
+        dialog = NewRecordingDialog(self.get_root(), self.library)
+        dialog.connect("close-request", lambda *_: self._toast("Zaplanowano nagranie.") if dialog.saved else None)
+        dialog.present()
 
     def reload(self) -> None:
         while (row := self.listbox.get_row_at_index(0)) is not None:

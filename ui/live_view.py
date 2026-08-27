@@ -13,11 +13,23 @@ from gi.repository import Gtk, Adw, GLib, GObject, Pango  # noqa: E402
 from tvh.library import TvhLibrary
 from tvh.models import Channel, EpgEvent
 from player.stream_controller import StreamController, SUBTITLE_AUTO
+from ui.icon_cache import make_icon_widget, update_icon_widget
 
 # OSD znika po 5 s bez ruchu myszy / kliknięcia
 OSD_HIDE_DELAY_MS = 5000
 # Odświeżanie paska postępu audycji
 PROGRESS_TICK_MS = 2000
+
+
+def _font_size_attrs(pt: int, bold: bool = False) -> Pango.AttrList:
+    """Buduje Pango.AttrList wymuszajaca konkretny rozmiar (i opcjonalnie
+    pogrubienie) niezaleznie od klasy CSS libadwaita (title-2 itp. maja
+    stale, male rozmiary nieodpowiednie dla OSD ogladanego z odleglosci)."""
+    attrs = Pango.AttrList()
+    attrs.insert(Pango.attr_size_new(int(pt * Pango.SCALE)))
+    if bold:
+        attrs.insert(Pango.attr_weight_new(Pango.Weight.BOLD))
+    return attrs
 
 
 class LiveView(Gtk.Box):
@@ -131,6 +143,10 @@ class LiveView(Gtk.Box):
         library.connect("epg-changed", self._on_epg_changed)
         library.connect("recordings-changed", self._on_stream_info_changed)
 
+        self._desc_scroll_source: Optional[int] = None
+        self._desc_scroll_adj: Optional[Gtk.Adjustment] = None
+        self.apply_osd_prefs()
+
     # ------------------------------------------------------------------ #
     def _build_osd(self) -> None:
         # --- Górna belka: kanał + zegar --------------------------------
@@ -142,6 +158,9 @@ class LiveView(Gtk.Box):
 
         self.list_btn = self._osd_button("view-list-symbolic", self._on_toggle_channel_list)
         self.list_btn.set_tooltip_text("Lista kanałów")
+
+        self.osd_channel_icon = make_icon_widget("tv-symbolic", 48, None)
+        self.osd_channel_icon.set_valign(Gtk.Align.CENTER)
 
         self.channel_lbl = Gtk.Label(xalign=0, hexpand=True)
         self.channel_lbl.add_css_class("title-2")
@@ -171,6 +190,7 @@ class LiveView(Gtk.Box):
         self.clock_lbl.add_css_class("title-4")
 
         self.top_osd.append(self.list_btn)
+        self.top_osd.append(self.osd_channel_icon)
         self.top_osd.append(info_box)
         self.top_osd.append(self.clock_lbl)
         self.top_osd.set_margin_top(12)
@@ -193,17 +213,24 @@ class LiveView(Gtk.Box):
         self.program_title_lbl.set_ellipsize(Pango.EllipsizeMode.END)
         self.program_title_lbl.set_wrap(False)
 
-        self.program_desc_lbl = Gtk.Label(xalign=0)
+        self.program_desc_lbl = Gtk.Label(xalign=0, yalign=0)
         self.program_desc_lbl.add_css_class("caption")
         self.program_desc_lbl.add_css_class("dim-label")
-        self.program_desc_lbl.set_ellipsize(Pango.EllipsizeMode.END)
-        self.program_desc_lbl.set_lines(2)
         self.program_desc_lbl.set_wrap(True)
         self.program_desc_lbl.set_max_width_chars(80)
 
+        # Owinięte w ScrolledWindow o ustalonej wysokości - gdy opis nie
+        # mieści się, i autoscroll jest włączony w preferencjach, animujemy
+        # Gtk.Adjustment (góra→dół lub dół→góra). Gdy autoscroll wyłączony,
+        # zachowuje się jak zwykły label z ellipsize/limitem linii.
+        self.program_desc_scroller = Gtk.ScrolledWindow()
+        self.program_desc_scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.EXTERNAL)
+        self.program_desc_scroller.set_child(self.program_desc_lbl)
+        self.program_desc_scroller.set_propagate_natural_height(False)
+
         prog_info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
         prog_info.append(self.program_title_lbl)
-        prog_info.append(self.program_desc_lbl)
+        prog_info.append(self.program_desc_scroller)
 
         # Czas + pasek postępu audycji (EPG: start → stop)
         self.time_start_lbl = Gtk.Label(label="--:--")
@@ -372,6 +399,7 @@ class LiveView(Gtk.Box):
         self.stream_info_lbl.set_visible(False)
         self.stream_ctrl.play_channel(channel)
         self.channel_lbl.set_text(f"{channel.number or ''} {channel.name}".strip())
+        update_icon_widget(self.osd_channel_icon, self.library.resolve_icon_url(channel.icon_url))
         self._update_program_info(channel)
         self.video_stack.set_visible_child_name("video")
         self.play_btn.set_child(
@@ -392,11 +420,12 @@ class LiveView(Gtk.Box):
         if not ev:
             self.program_title_lbl.set_text("Brak danych EPG")
             self.program_desc_lbl.set_text("")
-            self.program_desc_lbl.set_visible(False)
+            self.program_desc_scroller.set_visible(False)
             self.time_start_lbl.set_text("--:--")
             self.time_end_lbl.set_text("--:--")
             self.time_remain_lbl.set_text("")
             self.progress.set_fraction(0.0)
+            self._stop_desc_scroll()
             return
 
         title = ev.title or "Bez tytułu"
@@ -406,13 +435,14 @@ class LiveView(Gtk.Box):
 
         desc = (ev.description or "").strip()
         if desc:
-            # Jedna linia / skrót – pełny opis w tooltipie
             self.program_desc_lbl.set_text(desc)
             self.program_desc_lbl.set_tooltip_text(desc)
-            self.program_desc_lbl.set_visible(True)
+            self.program_desc_scroller.set_visible(True)
+            self._restart_desc_scroll()
         else:
             self.program_desc_lbl.set_text("")
-            self.program_desc_lbl.set_visible(False)
+            self.program_desc_scroller.set_visible(False)
+            self._stop_desc_scroll()
 
         self.time_start_lbl.set_text(time.strftime("%H:%M", time.localtime(ev.start)))
         self.time_end_lbl.set_text(time.strftime("%H:%M", time.localtime(ev.stop)))
@@ -422,11 +452,87 @@ class LiveView(Gtk.Box):
         self._current_event = None
         self.program_title_lbl.set_text("")
         self.program_desc_lbl.set_text("")
-        self.program_desc_lbl.set_visible(False)
+        self.program_desc_scroller.set_visible(False)
+        self._stop_desc_scroll()
         self.time_start_lbl.set_text("--:--")
         self.time_end_lbl.set_text("--:--")
         self.time_remain_lbl.set_text("")
         self.progress.set_fraction(0.0)
+
+    # ------------------------------------------------------------------ #
+    # Preferencje OSD: rozmiar czcionki gornego paska, rozmiar czcionki
+    # opisu audycji, automatyczne przewijanie dlugiego opisu i kierunek.
+    # ------------------------------------------------------------------ #
+    def apply_osd_prefs(self) -> None:
+        from tvh.config import load_player_prefs
+        prefs = load_player_prefs()
+        self._osd_prefs = prefs
+
+        top_pt = getattr(prefs, "osd_top_bar_font_pt", 20) or 20
+        self.channel_lbl.set_attributes(_font_size_attrs(top_pt, bold=True))
+        self.clock_lbl.set_attributes(_font_size_attrs(top_pt))
+
+        desc_pt = getattr(prefs, "osd_subtitle_font_pt", 16) or 16
+        self.program_desc_lbl.set_attributes(_font_size_attrs(desc_pt))
+
+        # Wysokosc widocznego okna opisu ~ 3 linie przy biezacym rozmiarze
+        # czcionki, zeby autoscroll mial co przewijac, a bez autoscrolla
+        # tekst po prostu przycina sie do tej wysokosci.
+        self.program_desc_scroller.set_min_content_height(int(desc_pt * 1.4 * 3))
+        self.program_desc_scroller.set_max_content_height(int(desc_pt * 1.4 * 3))
+
+        if self._current_event is not None:
+            self._restart_desc_scroll()
+
+    def _stop_desc_scroll(self) -> None:
+        if self._desc_scroll_source is not None:
+            GLib.source_remove(self._desc_scroll_source)
+            self._desc_scroll_source = None
+        self._desc_scroll_adj = None
+
+    def _restart_desc_scroll(self) -> None:
+        self._stop_desc_scroll()
+        prefs = getattr(self, "_osd_prefs", None)
+        if prefs is None or not getattr(prefs, "osd_desc_autoscroll", False):
+            return
+        direction = getattr(prefs, "osd_desc_scroll_direction", "down")
+        adj = self.program_desc_scroller.get_vadjustment()
+        self._desc_scroll_adj = adj
+
+        # Czekamy jedna klatke, zeby label zdazyl przeliczyc swoja
+        # naturalna wysokosc po set_text() - inaczej get_upper() bywa 0.
+        def _prime() -> bool:
+            upper = adj.get_upper() - adj.get_page_size()
+            if upper <= 1:
+                # Tekst miesci sie w calosci - nic do przewijania.
+                return False
+            adj.set_value(upper if direction == "up" else 0)
+            self._desc_scroll_source = GLib.timeout_add(60, self._tick_desc_scroll, direction)
+            return False
+
+        GLib.idle_add(_prime)
+
+    def _tick_desc_scroll(self, direction: str) -> bool:
+        adj = self._desc_scroll_adj
+        if adj is None:
+            self._desc_scroll_source = None
+            return False
+        upper = adj.get_upper() - adj.get_page_size()
+        if upper <= 1:
+            self._desc_scroll_source = None
+            return False
+        step = upper / 240.0  # pelny przejazd w ok. 240 * 60ms = 14.4s
+        value = adj.get_value()
+        if direction == "up":
+            value -= step
+            if value <= 0:
+                value = upper  # zawin z powrotem na dol (gora -> dol -> gora)
+        else:
+            value += step
+            if value >= upper:
+                value = 0  # zawin z powrotem na gore (dol -> gora -> dol)
+        adj.set_value(value)
+        return True
 
     def _refresh_progress(self) -> None:
         ev = self._current_event
@@ -448,11 +554,17 @@ class LiveView(Gtk.Box):
         else:
             self.time_remain_lbl.set_text(f"−{remain // 60}:{remain % 60:02d}")
 
-        # Koniec audycji → odśwież EPG
+        # Koniec audycji → odśwież EPG (tylko jesli biblioteka faktycznie
+        # zwrocila NOWE wydarzenie - w przeciwnym razie petla
+        # _update_program_info -> _refresh_progress -> _update_program_info
+        # odpalalaby sie w nieskonczonosc, gdy EPG jeszcze nie zdazyl
+        # zaktualizowac danych po zakonczeniu audycji).
         if now >= ev.stop:
             ch = self.stream_ctrl.current_channel
             if ch:
-                self._update_program_info(ch)
+                next_ev = self.library.current_event_for_channel(ch.channel_id, int(now))
+                if next_ev is not None and next_ev is not ev:
+                    self._update_program_info(ch)
 
     def _ensure_progress_timer(self) -> None:
         if self._progress_source is not None:
@@ -541,6 +653,7 @@ class LiveView(Gtk.Box):
         self.stream_ctrl.stop()
         self.video_stack.set_visible_child_name("placeholder")
         self.channel_lbl.set_text("")
+        update_icon_widget(self.osd_channel_icon, None)
         self._clear_program_info()
         self._stop_progress_timer()
         self._hide_osd()
@@ -788,6 +901,34 @@ class LiveView(Gtk.Box):
         font_row.set_value(prefs.subtitle_font_pt)
         group_lang.add(font_row)
 
+        # --- Napisy OSD (nakladka GTK, nie dekoder) ---
+        group_osd = Adw.PreferencesGroup(
+            title="Napisy OSD",
+            description="Rozmiar czcionki i przewijanie opisu audycji w dolnej belce OSD "
+            "oraz rozmiar czcionki górnego paska (nazwa kanału, zegar).",
+        )
+        page.add(group_osd)
+
+        top_font_row = Adw.SpinRow.new_with_range(12, 48, 1)
+        top_font_row.set_title("Rozmiar czcionki górnego paska OSD (pt)")
+        top_font_row.set_value(getattr(prefs, "osd_top_bar_font_pt", 20))
+        group_osd.add(top_font_row)
+
+        osd_font_row = Adw.SpinRow.new_with_range(10, 40, 1)
+        osd_font_row.set_title("Rozmiar czcionki opisu audycji OSD (pt)")
+        osd_font_row.set_value(getattr(prefs, "osd_subtitle_font_pt", 16))
+        group_osd.add(osd_font_row)
+
+        autoscroll_row = Adw.SwitchRow(title="Automatyczne przewijanie opisu")
+        autoscroll_row.set_subtitle("Gdy opis nie mieści się w widocznym obszarze")
+        autoscroll_row.set_active(getattr(prefs, "osd_desc_autoscroll", False))
+        group_osd.add(autoscroll_row)
+
+        direction_row = Adw.ComboRow(title="Kierunek przewijania")
+        direction_row.set_model(Gtk.StringList.new(["Góra → dół", "Dół → góra"]))
+        direction_row.set_selected(0 if getattr(prefs, "osd_desc_scroll_direction", "down") == "down" else 1)
+        group_osd.add(direction_row)
+
         def _save(*_a):
             dmap = {0: "auto", 1: "hw", 2: "sw"}
             omap = {
@@ -805,9 +946,14 @@ class LiveView(Gtk.Box):
                 preferred_sub_langs=[x.strip() for x in sub_entry.get_text().split(",") if x.strip()],
                 subtitles_enabled=sub_en.get_active(),
                 subtitle_font_pt=int(font_row.get_value()),
+                osd_top_bar_font_pt=int(top_font_row.get_value()),
+                osd_subtitle_font_pt=int(osd_font_row.get_value()),
+                osd_desc_autoscroll=autoscroll_row.get_active(),
+                osd_desc_scroll_direction="down" if direction_row.get_selected() == 0 else "up",
             )
             save_player_prefs(new_prefs)
             self.stream_ctrl.reload_prefs()
+            self.apply_osd_prefs()
             dialog.close()
 
         # Przycisk zapisu w nagłówku
