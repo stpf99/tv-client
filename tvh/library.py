@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import itertools
 import logging
+import threading
 from typing import Callable, Dict, Optional
 
 import gi
@@ -53,6 +54,16 @@ class TvhLibrary(GObject.GObject):
         super().__init__()
         self.client = HtspClient()
         self.channels: Dict[int, Channel] = {}
+        # Cache posortowanych list tv_channels()/radio_channels() - budowa
+        # tych list to sorted() nad calym slownikiem kanalow, wolane z
+        # reload() w kazdym widoku (lista kanalow, EPG, siatka EPG) przy
+        # kazdym channels-changed. Bez cache to sortowanie powtarza sie
+        # (liczba widokow x liczba emitow) razy dla tych samych danych.
+        # _channels_version jest inkrementowany przy KAZDEJ zmianie skladu
+        # kanalow lub flagi is_radio - to jedyny warunek uniewazniania.
+        self._channels_version = 0
+        self._tv_channels_cache: Optional[tuple] = None
+        self._radio_channels_cache: Optional[tuple] = None
         self.tags: Dict[int, ChannelTag] = {}
         self.events: Dict[int, EpgEvent] = {}
         self.events_by_channel: Dict[int, list] = {}
@@ -76,6 +87,7 @@ class TvhLibrary(GObject.GObject):
         # i GTK zglasza "nie odpowiada". Zamiast tego zbieramy zmiany i
         # emitujemy sygnal co ~150-200ms (jeden rebuild zamiast tysiecy).
         self._channels_emit_scheduled = False
+        self._channels_last_emitted_version = 0
         self._epg_dirty_channels: set[int] = set()
         self._epg_emit_scheduled = False
         self._sync_channel_count = 0
@@ -165,6 +177,7 @@ class TvhLibrary(GObject.GObject):
         # gdy przyjdzie/zaktualizuje sie tagAdd.
         old = self.channels.get(ch.channel_id)
         self.channels[ch.channel_id] = ch
+        self._channels_version += 1
         self._sync_channel_count += 1
         if any("radio" in self.tags[tid].name.lower() for tid in ch.tag_ids if tid in self.tags):
             ch.is_radio = True
@@ -176,6 +189,7 @@ class TvhLibrary(GObject.GObject):
 
     def _on_channel_delete(self, m: dict) -> None:
         self.channels.pop(m.get("channelId"), None)
+        self._channels_version += 1
         self._schedule_channels_changed()
 
     def _on_tag_add(self, m: dict) -> None:
@@ -191,10 +205,23 @@ class TvhLibrary(GObject.GObject):
         if self._channels_emit_scheduled:
             return
         self._channels_emit_scheduled = True
-        GLib.timeout_add(150, self._flush_channels_changed)
+        # 400ms (bylo 150ms): kazdy emit tego sygnalu wyzwala pelna
+        # przebudowe listy kanalow w kazdym otwartym widoku (lista, EPG,
+        # siatka EPG) - podczas synchronizacji setek kanalow rzadszy
+        # debounce oznacza kilka przebudow zamiast kilkunastu, bez zadnej
+        # zauwazalnej roznicy w postrzeganej plynnosci startu.
+        GLib.timeout_add(400, self._flush_channels_changed)
 
     def _flush_channels_changed(self) -> bool:
         self._channels_emit_scheduled = False
+        # Jesli miedzy poprzednim emitem a teraz nic sie faktycznie nie
+        # zmienilo w skladzie/is_radio kanalow (np. przyszly tylko
+        # eventAdd, ktore planuja epg-changed, nie channels-changed - ale
+        # to zabezpieczenie na przyszlosc/inne wywolania), pomijamy emit i
+        # tym samym kosztowna przebudowe list w widokach.
+        if self._channels_version == self._channels_last_emitted_version:
+            return False
+        self._channels_last_emitted_version = self._channels_version
         self.emit("channels-changed")
         return False
 
@@ -231,10 +258,14 @@ class TvhLibrary(GObject.GObject):
         }
         if not radio_tag_ids:
             return
+        changed = False
         for ch in self.channels.values():
-            if any(tid in radio_tag_ids for tid in ch.tag_ids):
+            if any(tid in radio_tag_ids for tid in ch.tag_ids) and not ch.is_radio:
                 ch.is_radio = True
-        self.emit("channels-changed")
+                changed = True
+        if changed:
+            self._channels_version += 1
+            self._schedule_channels_changed()
 
     def _on_event_add(self, m: dict) -> None:
         ev = EpgEvent.from_htsp(m)
@@ -243,15 +274,35 @@ class TvhLibrary(GObject.GObject):
         if ch_id not in self.events_by_channel:
             self.events_by_channel[ch_id] = []
         lst = self.events_by_channel[ch_id]
-        # aktualizacja lub dopisanie
+        # aktualizacja lub dopisanie - lista jest zawsze utrzymywana
+        # posortowana wg start, wiec zamiast pelnego lst.sort() po kazdym
+        # evencie (O(n log n) x tysiace eventow podczas pelnej
+        # synchronizacji), usuwamy stary wpis (jesli byl) i wstawiamy nowy
+        # we wlasciwe miejsce przez binarne wyszukiwanie (O(log n) zamiast
+        # sortowania calej listy od nowa).
+        def _insert_sorted(lst: list, ev: EpgEvent) -> None:
+            lo, hi = 0, len(lst)
+            while lo < hi:
+                mid = (lo + hi) // 2
+                if lst[mid].start < ev.start:
+                    lo = mid + 1
+                else:
+                    hi = mid
+            lst.insert(lo, ev)
+
         for i, old in enumerate(lst):
             if old.event_id == ev.event_id:
-                lst[i] = ev
+                if old.start == ev.start:
+                    # czesty przypadek (np. eventUpdate zmieniajacy tylko
+                    # tytul/opis) - kolejnosc sie nie zmienia, podmieniamy
+                    # w miejscu bez zadnego przeszukiwania/przesuwania.
+                    lst[i] = ev
+                    break
+                del lst[i]
+                _insert_sorted(lst, ev)
                 break
         else:
-            lst.append(ev)
-        # utrzymuj posortowaną listę – widok EPG i „sąsiedzi” tego wymagają
-        lst.sort(key=lambda e: e.start)
+            _insert_sorted(lst, ev)
         self._sync_event_count += 1
         # diagnostyka: pierwsze eventy – raw vs znormalizowane vs zegar systemowy
         if self._sync_event_count <= 5:
@@ -295,18 +346,43 @@ class TvhLibrary(GObject.GObject):
         zamiast czekac na pelna synchronizacje z serwera. Prawdziwe dane z
         serwera i tak normalnie naplyna i nadpisza to (po channel_id/
         event_id), wiec to jest czysto kosmetyczne przyspieszenie
-        postrzeganego czasu startu, nie zamiennik synchronizacji."""
+        postrzeganego czasu startu, nie zamiennik synchronizacji.
+
+        Odczyt pliku i parsowanie JSON (setki/tysiace zdarzen EPG) robimy w
+        watku roboczym - connect_to_server() jest wolane z GLib.idle_add na
+        glownym watku GTK (juz PO window.present()), wiec zrobienie tego
+        odczytu synchronicznie tutaj blokowaloby petle zdarzen dokladnie w
+        tym samym miejscu (okno widoczne, ale "nie odpowiada"), tyle ze o
+        chwile pozniej niz przy problemie z ikonami.
+        """
         from tvh.config import load_player_prefs
         prefs = load_player_prefs()
         if not getattr(prefs, "epg_cache_enabled", True):
             return
 
+        threading.Thread(
+            target=self._load_disk_cache_worker,
+            args=(host, port),
+            daemon=True,
+        ).start()
+
+    def _load_disk_cache_worker(self, host: str, port: int) -> None:
         result = epg_cache.load(host, port)
+        GLib.idle_add(self._apply_disk_cache, host, port, result)
+
+    def _apply_disk_cache(self, host: str, port: int, result) -> bool:
+        # Serwer/port mogl sie zmienic (np. uzytkownik kliknal "polacz z
+        # innym serwerem") zanim watek wczytywania skonczyl - w takim razie
+        # ten wynik jest juz nieaktualny i go pomijamy.
+        if (self.host, self.port) != (host, port):
+            return False
         if result is None:
-            return
+            return False
         channels, events = result
         for ch in channels:
             self.channels[ch.channel_id] = ch
+        if channels:
+            self._channels_version += 1
         for ev in events:
             self.events[ev.event_id] = ev
             self.events_by_channel.setdefault(ev.channel_id, []).append(ev)
@@ -317,9 +393,11 @@ class TvhLibrary(GObject.GObject):
             "Wczytano z cache: %d kanałów, %d zdarzeń EPG (wstępny widok przed synchronizacją)",
             len(channels), len(events),
         )
+        self._channels_last_emitted_version = self._channels_version
         self.emit("channels-changed")
         for ch_id in self.events_by_channel:
             self.emit("epg-changed", ch_id)
+        return False
 
     def _save_disk_cache(self) -> None:
         from tvh.config import load_player_prefs
@@ -328,12 +406,23 @@ class TvhLibrary(GObject.GObject):
             return
         if not self.host:
             return
-        epg_cache.save(self.host, self.port, list(self.channels.values()), self.events_by_channel)
+        # Kopiujemy listy/slowniki tutaj (na glownym watku - tanie, to
+        # tylko referencje) i oddajemy serializacje JSON watkowi roboczemu,
+        # zeby nie blokowac GTK przy duzej bazie EPG.
+        channels = list(self.channels.values())
+        events_by_channel = dict(self.events_by_channel)
+        host, port = self.host, self.port
+        threading.Thread(
+            target=epg_cache.save,
+            args=(host, port, channels, events_by_channel),
+            daemon=True,
+        ).start()
 
     def _on_initial_sync(self) -> None:
         self._initial_sync_done = True
         self.showing_cached_data = False
         # finalny, pelny rebuild widokow po zakonczeniu synchronizacji
+        self._channels_last_emitted_version = self._channels_version
         self.emit("channels-changed")
         self.emit("initial-sync-done")
         self._save_disk_cache()
@@ -639,16 +728,24 @@ class TvhLibrary(GObject.GObject):
     # Pomocnicze widoki danych
     # ------------------------------------------------------------------ #
     def tv_channels(self):
-        return sorted(
+        if self._tv_channels_cache is not None and self._tv_channels_cache[0] == self._channels_version:
+            return self._tv_channels_cache[1]
+        result = sorted(
             (c for c in self.channels.values() if not c.is_radio),
             key=lambda c: c.number or c.channel_id,
         )
+        self._tv_channels_cache = (self._channels_version, result)
+        return result
 
     def radio_channels(self):
-        return sorted(
+        if self._radio_channels_cache is not None and self._radio_channels_cache[0] == self._channels_version:
+            return self._radio_channels_cache[1]
+        result = sorted(
             (c for c in self.channels.values() if c.is_radio),
             key=lambda c: c.number or c.channel_id,
         )
+        self._radio_channels_cache = (self._channels_version, result)
+        return result
 
     def current_event_for_channel(self, channel_id: int, now_ts: int) -> Optional[EpgEvent]:
         """Aktualna audycja wg pełnej daty+czasu (unix seconds == time.time()).
