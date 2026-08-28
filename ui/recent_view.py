@@ -27,7 +27,7 @@ class RecentTile(Gtk.Button):
         box.set_margin_start(10)
         box.set_margin_end(10)
 
-        icon = make_icon_widget("tv-symbolic", 60, library.resolve_icon_url(entry.icon_url))
+        icon = make_icon_widget("tv-symbolic", 40, library.resolve_icon_url(entry.icon_url))
         icon.set_vexpand(True)
         box.append(icon)
 

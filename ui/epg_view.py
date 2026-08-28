@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from typing import Optional
 
 import gi
@@ -13,7 +13,9 @@ from gi.repository import Gtk, Adw, Pango, GLib  # noqa: E402
 
 from tvh.library import TvhLibrary
 from tvh.models import EpgEvent
-from ui.epg_search import EpgQuery, parse_query
+from tvh.genres import all_genres
+from ui.reminders import ReminderStore
+from ui.epg_grid_view import EpgGridView
 
 
 def _fmt_range(start: int, stop: int, now_ts: int | None = None) -> str:
@@ -71,11 +73,16 @@ class EpgEventRow(Gtk.Box):
         event: EpgEvent,
         tag: str = "",
         is_current: bool = False,
+        channel_name: str = "",
+        reminder_store: Optional[ReminderStore] = None,
+        show_channel_name: bool = False,
     ) -> None:
         super().__init__(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         self.library = library
         self.channel_id = channel_id
+        self.channel_name = channel_name
         self.event = event
+        self.reminder_store = reminder_store
         self.set_margin_start(4)
         self.set_margin_end(4)
         self.set_margin_top(2)
@@ -108,6 +115,12 @@ class EpgEventRow(Gtk.Box):
         else:
             title_lbl.add_css_class("caption")
         title_box.append(title_lbl)
+        if show_channel_name and channel_name:
+            ch_lbl = Gtk.Label(label=channel_name, xalign=0)
+            ch_lbl.add_css_class("dim-label")
+            ch_lbl.add_css_class("caption")
+            ch_lbl.set_ellipsize(Pango.EllipsizeMode.END)
+            title_box.append(ch_lbl)
         if event.subtitle:
             sub = Gtk.Label(label=event.subtitle, xalign=0)
             sub.add_css_class("dim-label")
@@ -140,6 +153,19 @@ class EpgEventRow(Gtk.Box):
         rec_manual.connect("clicked", self._on_record_manual)
         btn_box.append(rec_manual)
 
+        if self.reminder_store is not None:
+            self.remind_btn = Gtk.ToggleButton()
+            self.remind_btn.add_css_class("flat")
+            self.remind_btn.add_css_class("circular")
+            has = self.reminder_store.has_reminder(event.event_id)
+            self.remind_btn.set_active(has)
+            self.remind_btn.set_icon_name("alarm-symbolic")
+            self.remind_btn.set_tooltip_text(
+                "Usuń przypomnienie" if has else "Przypomnij przed startem"
+            )
+            self.remind_btn.connect("toggled", self._on_remind_toggled)
+            btn_box.append(self.remind_btn)
+
         self.append(btn_box)
 
     def _on_record_once(self, *_a) -> None:
@@ -161,17 +187,37 @@ class EpgEventRow(Gtk.Box):
             stop=self.event.stop,
         )
 
+    def _on_remind_toggled(self, btn: Gtk.ToggleButton) -> None:
+        if self.reminder_store is None:
+            return
+        if btn.get_active():
+            self.reminder_store.add(
+                event_id=self.event.event_id,
+                channel_id=self.channel_id,
+                channel_name=self.channel_name,
+                title=self.event.title or "(bez tytułu)",
+                start=self.event.start,
+                stop=self.event.stop,
+            )
+            btn.set_tooltip_text("Usuń przypomnienie")
+        else:
+            self.reminder_store.remove(self.event.event_id)
+            btn.set_tooltip_text("Przypomnij przed startem")
+
 
 class EpgChannelRow(Gtk.ListBoxRow):
     """Kanał + sąsiadujące programy (gazeta EPG): TERAZ + kolejne z pełnych danych."""
 
     MAX_EVENTS = 6  # teraz + następne
 
-    def __init__(self, library: TvhLibrary, channel_id: int, channel_name: str) -> None:
+    def __init__(self, library: TvhLibrary, channel_id: int, channel_name: str,
+                 reminder_store: Optional[ReminderStore] = None) -> None:
         super().__init__()
         self.library = library
         self.channel_id = channel_id
         self.channel_name = channel_name
+        self.reminder_store = reminder_store
+
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         box.set_margin_top(10)
         box.set_margin_bottom(10)
@@ -194,10 +240,7 @@ class EpgChannelRow(Gtk.ListBoxRow):
         self.set_child(box)
         self.refresh()
 
-    def refresh(self, query: Optional[EpgQuery] = None) -> bool:
-        """Odswieza wiersz kanalu. Zwraca True, jesli kanal ma cokolwiek
-        do pokazania (przy aktywnym query - czy jakikolwiek program
-        pasuje do wyszukiwania), False gdy wiersz nalezy ukryc."""
+    def refresh(self) -> None:
         # wyczyść poprzednie wiersze programów
         while (child := self.events_box.get_first_child()) is not None:
             self.events_box.remove(child)
@@ -215,34 +258,6 @@ class EpgChannelRow(Gtk.ListBoxRow):
         events = [
             e for e in self.library.events_by_channel.get(self.channel_id, []) if _sane(e)
         ]
-
-        has_query = query is not None and not query.is_empty
-        if has_query:
-            events = [e for e in events if query.matches(e, self.channel_name, now)]
-            if not events:
-                return False
-            # przy aktywnym wyszukiwaniu pokazujemy dopasowane programy
-            # chronologicznie, bez sztucznego dzielenia na TERAZ/NASTĘPNIE
-            events.sort(key=lambda e: e.start)
-            shown = events[: self.MAX_EVENTS]
-            tags = [""] * len(shown)
-            is_curr = [
-                e.start <= now < e.stop for e in shown
-            ]
-            if shown:
-                self.day_hint.set_text(_day_label(shown[0].start, now))
-            else:
-                self.day_hint.set_text("")
-            for i, ev in enumerate(shown):
-                row = EpgEventRow(
-                    self.library,
-                    self.channel_id,
-                    ev,
-                    tag=tags[i] if i < len(tags) else "",
-                    is_current=is_curr[i] if i < len(is_curr) else False,
-                )
-                self.events_box.append(row)
-            return True
 
         # Aktualny program: eventId + weryfikacja start/stop vs time.time()
         current = self.library.current_event_for_channel(self.channel_id, now)
@@ -269,7 +284,7 @@ class EpgChannelRow(Gtk.ListBoxRow):
                 empty.add_css_class("caption")
                 self.events_box.append(empty)
                 self.day_hint.set_text("")
-                return True
+                return
             shown = upcoming
             tags = ["NASTĘPNIE"] + [""] * (len(shown) - 1)
             is_curr = [False] * len(shown)
@@ -293,39 +308,62 @@ class EpgChannelRow(Gtk.ListBoxRow):
                 ev,
                 tag=tags[i] if i < len(tags) else "",
                 is_current=is_curr[i] if i < len(is_curr) else False,
+                channel_name=self.channel_name,
+                reminder_store=self.reminder_store,
             )
             self.events_box.append(row)
-        return True
+
 
 class EpgView(Gtk.Box):
-    """Przewodnik: lista kanałów z sąsiadującymi programami (gazeta EPG),
-    pełne dane + data + 24h zegar + ikony PVR (jednorazowo / seria / ręcznie).
+    """Przewodnik: trzy tryby widoku - siatka z osią czasu (grid, jak w
+    04-epg-grid.png), lista/gazeta per kanał (TERAZ/NASTĘPNIE, jak w
+    05-epg-list.png) oraz wyniki wyszukiwania. Rozbudowany pasek
+    wyszukiwania (tytuł/opis, kanały, zakres dat) + filtr gatunku, zgodnie
+    z oryginalnym projektem.
     """
 
-    def __init__(self, library: TvhLibrary) -> None:
+    def __init__(self, library: TvhLibrary, reminder_store: Optional[ReminderStore] = None) -> None:
         super().__init__(orientation=Gtk.Orientation.VERTICAL)
         self.library = library
-        self._query: Optional[EpgQuery] = None
+        self.reminder_store = reminder_store
+        self._search_source: Optional[int] = None
+        self._active_mode = "grid"  # "grid" | "list" - tryb do ktorego wracamy po wyczyszczeniu wyszukiwania
 
-        # pasek narzędzi: wyszukiwarka / odśwież
+        # --- górny pasek: grid/lista/szukaj + filtr gatunku + odśwież ---
         toolbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         toolbar.set_margin_top(6)
         toolbar.set_margin_bottom(4)
         toolbar.set_margin_start(12)
         toolbar.set_margin_end(12)
 
-        self.search_entry = Gtk.SearchEntry()
-        self.search_entry.set_hexpand(True)
-        self.search_entry.set_placeholder_text(
-            "Szukaj: tytuł, opis, kanał, gatunek (film, sport…), data (12.08, jutro), godzina (20:00-22:00, po 20)"
-        )
-        self.search_entry.connect("search-changed", self._on_search_changed)
-        toolbar.append(self.search_entry)
+        mode_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        mode_box.add_css_class("linked")
+        self.grid_mode_btn = Gtk.ToggleButton(icon_name="view-grid-symbolic")
+        self.grid_mode_btn.set_tooltip_text("Widok siatki (oś czasu)")
+        self.grid_mode_btn.set_active(True)
+        self.grid_mode_btn.connect("toggled", self._on_mode_toggled, "grid")
+        mode_box.append(self.grid_mode_btn)
+        self.list_mode_btn = Gtk.ToggleButton(icon_name="view-list-symbolic")
+        self.list_mode_btn.set_tooltip_text("Widok listy (gazeta per kanał)")
+        self.list_mode_btn.set_group(self.grid_mode_btn)
+        self.list_mode_btn.connect("toggled", self._on_mode_toggled, "list")
+        mode_box.append(self.list_mode_btn)
+        toolbar.append(mode_box)
 
-        self.results_hint = Gtk.Label(xalign=1)
-        self.results_hint.add_css_class("caption")
-        self.results_hint.add_css_class("dim-label")
-        toolbar.append(self.results_hint)
+        self.search_toggle_btn = Gtk.ToggleButton(icon_name="edit-find-symbolic")
+        self.search_toggle_btn.set_tooltip_text("Szukaj audycji")
+        self.search_toggle_btn.connect("toggled", self._on_search_toggle)
+        toolbar.append(self.search_toggle_btn)
+
+        genre_names = ["Wszystkie gatunki"] + [label for _val, label in all_genres()]
+        self._genre_values = [None] + [val for val, _label in all_genres()]
+        self.genre_dropdown = Gtk.DropDown(model=Gtk.StringList.new(genre_names))
+        self.genre_dropdown.set_tooltip_text("Filtruj wg gatunku")
+        self.genre_dropdown.connect("notify::selected", self._on_genre_changed)
+        toolbar.append(self.genre_dropdown)
+
+        spacer = Gtk.Box(hexpand=True)
+        toolbar.append(spacer)
 
         refresh_btn = Gtk.Button(icon_name="view-refresh-symbolic")
         refresh_btn.add_css_class("flat")
@@ -334,15 +372,92 @@ class EpgView(Gtk.Box):
         toolbar.append(refresh_btn)
         self.append(toolbar)
 
-        scroller = Gtk.ScrolledWindow(vexpand=True)
+        # --- rozwijany pasek wyszukiwania zaawansowanego ---
+        self.search_revealer = Gtk.Revealer(transition_type=Gtk.RevealerTransitionType.SLIDE_DOWN)
+        search_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        search_box.set_margin_start(12)
+        search_box.set_margin_end(12)
+        search_box.set_margin_bottom(6)
+
+        self.search_entry = Gtk.SearchEntry(placeholder_text="Szukaj w tytule / opisie…")
+        self.search_entry.set_hexpand(True)
+        self.search_entry.connect("search-changed", self._on_search_changed)
+        search_box.append(self.search_entry)
+
+        self.channels_entry = Gtk.Entry(placeholder_text="Kanały: TVP1, Polsat…")
+        self.channels_entry.set_width_chars(20)
+        self.channels_entry.connect("changed", self._on_search_changed)
+        search_box.append(self.channels_entry)
+
+        self.date_from_entry = Gtk.Entry(placeholder_text="Od: RRRR-MM-DD")
+        self.date_from_entry.set_width_chars(12)
+        self.date_from_entry.connect("changed", self._on_search_changed)
+        search_box.append(self.date_from_entry)
+
+        self.date_to_entry = Gtk.Entry(placeholder_text="Do: RRRR-MM-DD")
+        self.date_to_entry.set_width_chars(12)
+        self.date_to_entry.connect("changed", self._on_search_changed)
+        search_box.append(self.date_to_entry)
+
+        clear_btn = Gtk.Button(icon_name="edit-clear-symbolic")
+        clear_btn.add_css_class("flat")
+        clear_btn.set_tooltip_text("Wyczyść wyszukiwanie")
+        clear_btn.connect("clicked", self._on_clear_search)
+        search_box.append(clear_btn)
+
+        self.search_revealer.set_child(search_box)
+        self.append(self.search_revealer)
+
+        hint = Gtk.Label(xalign=0)
+        hint.add_css_class("caption")
+        hint.add_css_class("dim-label")
+        hint.set_margin_start(12)
+        hint.set_margin_bottom(4)
+        self.append(hint)
+        self._hint_lbl = hint
+
+        self.view_stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE)
+        self.view_stack.set_vexpand(True)
+        self.append(self.view_stack)
+
+        # --- widok siatki (grid, oś czasu) ---
+        self.grid_view = EpgGridView(library, self._on_grid_event_click)
+        self.view_stack.add_named(self.grid_view, "grid")
+
+        # --- widok gazetowy/listy (TERAZ/NASTĘPNIE per kanał) ---
+        guide_scroller = Gtk.ScrolledWindow(vexpand=True)
         self.listbox = Gtk.ListBox()
         self.listbox.add_css_class("boxed-list")
         self.listbox.set_margin_top(6)
         self.listbox.set_margin_bottom(10)
         self.listbox.set_margin_start(10)
         self.listbox.set_margin_end(10)
-        scroller.set_child(self.listbox)
-        self.append(scroller)
+        guide_scroller.set_child(self.listbox)
+        self.view_stack.add_named(guide_scroller, "list")
+
+        # --- widok wynikow wyszukiwania ---
+        search_scroller = Gtk.ScrolledWindow(vexpand=True)
+        self.search_listbox = Gtk.ListBox()
+        self.search_listbox.add_css_class("boxed-list")
+        self.search_listbox.set_margin_top(6)
+        self.search_listbox.set_margin_bottom(10)
+        self.search_listbox.set_margin_start(10)
+        self.search_listbox.set_margin_end(10)
+        search_scroller.set_child(self.search_listbox)
+
+        self.search_empty = Adw.StatusPage(
+            icon_name="edit-find-symbolic",
+            title="Brak wyników",
+            description="Nie znaleziono audycji pasujących do zapytania",
+        )
+
+        self.search_stack = Gtk.Stack()
+        self.search_stack.add_named(search_scroller, "results")
+        self.search_stack.add_named(self.search_empty, "empty")
+        self.view_stack.add_named(self.search_stack, "search")
+
+        self.view_stack.set_visible_child_name("grid")
+        self._set_hint_default()
 
         library.connect("channels-changed", lambda *_: self.reload())
         library.connect("epg-changed", lambda _lib, ch_id: self._refresh_channel(ch_id))
@@ -352,50 +467,217 @@ class EpgView(Gtk.Box):
         # okresowe odświeżenie „TERAZ” (co 60 s)
         GLib.timeout_add_seconds(60, self._tick)
 
-    def _on_search_changed(self, entry: Gtk.SearchEntry) -> None:
-        text = (entry.get_text() or "").strip()
-        self._query = parse_query(text) if text else None
-        self.reload()
+    def _set_hint_default(self) -> None:
+        if self._active_mode == "grid":
+            self._hint_lbl.set_text("Siatka: przewiń poziomo, ◀ Teraz ▶ zmienia okno czasowe")
+        else:
+            self._hint_lbl.set_text("Widok listy · data przy programach spoza dziś · 24h")
+
+    def _on_grid_event_click(self, event: EpgEvent, channel_id: int) -> None:
+        ch = self.library.channels.get(channel_id)
+        ch_name = ch.name if ch else f"Kanał {channel_id}"
+        dialog = Adw.Window(transient_for=self.get_root(), modal=True, title=ch_name)
+        dialog.set_default_size(420, -1)
+        tb = Adw.ToolbarView()
+        tb.add_top_bar(Adw.HeaderBar())
+        row = EpgEventRow(
+            self.library, channel_id, event,
+            channel_name=ch_name, reminder_store=self.reminder_store,
+        )
+        row.set_margin_top(8)
+        row.set_margin_bottom(8)
+        row.set_margin_start(8)
+        row.set_margin_end(8)
+        tb.set_content(row)
+        dialog.set_content(tb)
+        dialog.present()
+
+    def _on_mode_toggled(self, btn: Gtk.ToggleButton, mode: str) -> None:
+        if not btn.get_active():
+            return
+        self._active_mode = mode
+        if not self.search_toggle_btn.get_active():
+            self.view_stack.set_visible_child_name(mode)
+            self._set_hint_default()
+
+    def _on_genre_changed(self, *_a) -> None:
+        # zmiana gatunku, gdy trwa wyszukiwanie, powtarza zapytanie
+        if self.search_toggle_btn.get_active() and self.search_entry.get_text().strip():
+            self._on_search_changed(self.search_entry)
+
+    def _on_search_toggle(self, btn: Gtk.ToggleButton) -> None:
+        self.search_revealer.set_reveal_child(btn.get_active())
+        if btn.get_active():
+            self.search_entry.grab_focus()
+        else:
+            self.view_stack.set_visible_child_name(self._active_mode)
+            self._set_hint_default()
+
+    def _on_clear_search(self, *_a) -> None:
+        self.search_entry.set_text("")
+        self.channels_entry.set_text("")
+        self.date_from_entry.set_text("")
+        self.date_to_entry.set_text("")
+        self.genre_dropdown.set_selected(0)
+        self.search_toggle_btn.set_active(False)
 
     def _tick(self) -> bool:
-        query = self._query
         i = 0
         while (row := self.listbox.get_row_at_index(i)) is not None:
             if isinstance(row, EpgChannelRow):
-                row.refresh(query)
+                row.refresh()
             i += 1
         return True
 
     def reload(self) -> None:
         while (row := self.listbox.get_row_at_index(0)) is not None:
             self.listbox.remove(row)
-
-        query = self._query
-        has_query = query is not None and not query.is_empty
-        shown = 0
-
         for ch in self.library.tv_channels() + self.library.radio_channels():
-            row = EpgChannelRow(self.library, ch.channel_id, ch.name)
-            if has_query:
-                if not row.refresh(query):
-                    continue
-            self.listbox.append(row)
-            shown += 1
-
-        if has_query:
-            self.results_hint.set_text(
-                f"{shown} kanał" if shown == 1 else f"{shown} kanałów" if shown else "Brak wyników"
+            self.listbox.append(
+                EpgChannelRow(self.library, ch.channel_id, ch.name, reminder_store=self.reminder_store)
             )
-        else:
-            self.results_hint.set_text("")
+        self.grid_view.reload()
 
     def _refresh_channel(self, channel_id: int) -> None:
-        query = self._query
         i = 0
         while (row := self.listbox.get_row_at_index(i)) is not None:
             if isinstance(row, EpgChannelRow) and row.channel_id == channel_id:
-                visible = row.refresh(query)
-                if query is not None and not query.is_empty and not visible:
-                    self.listbox.remove(row)
+                row.refresh()
                 break
             i += 1
+
+    # ------------------------------------------------------------------ #
+    # Wyszukiwanie audycji (epgQuery na serwerze) - tytuł/opis + kanały +
+    # zakres dat + gatunek
+    # ------------------------------------------------------------------ #
+    def _on_search_changed(self, *_a) -> None:
+        if self._search_source is not None:
+            GLib.source_remove(self._search_source)
+            self._search_source = None
+        text = self.search_entry.get_text().strip()
+        channels_text = self.channels_entry.get_text().strip()
+        date_from = self.date_from_entry.get_text().strip()
+        date_to = self.date_to_entry.get_text().strip()
+        if not text and not channels_text and not date_from and not date_to:
+            self.view_stack.set_visible_child_name(self._active_mode)
+            self._set_hint_default()
+            return
+        # debounce 400ms - nie odpalaj epgQuery na kazde nacisniecie klawisza
+        self._search_source = GLib.timeout_add(400, self._run_search)
+
+    def _resolve_channel_filter(self, channels_text: str) -> Optional[int]:
+        """epgQuery filtruje po JEDNYM channelId - gdy user wpisał
+        rozpoznawalną nazwę pasującą do dokładnie jednego kanału, filtrujemy
+        po nim server-side; przy wielu/niejednoznacznych nazwach filtrujemy
+        po stronie klienta po otrzymaniu wyników (patrz _run_search)."""
+        if not channels_text:
+            return None
+        names = [n.strip().lower() for n in channels_text.split(",") if n.strip()]
+        if len(names) != 1:
+            return None
+        matches = [
+            ch for ch in (self.library.tv_channels() + self.library.radio_channels())
+            if names[0] in ch.name.lower()
+        ]
+        if len(matches) == 1:
+            return matches[0].channel_id
+        return None
+
+    def _run_search(self) -> bool:
+        self._search_source = None
+        text = self.search_entry.get_text().strip()
+        channels_text = self.channels_entry.get_text().strip()
+        date_from_text = self.date_from_entry.get_text().strip()
+        date_to_text = self.date_to_entry.get_text().strip()
+        genre_idx = self.genre_dropdown.get_selected()
+        content_type = self._genre_values[genre_idx] if 0 <= genre_idx < len(self._genre_values) else None
+
+        self._hint_lbl.set_text("Szukam…")
+
+        channel_id = self._resolve_channel_filter(channels_text)
+        channel_names_filter = None
+        if channels_text and channel_id is None:
+            channel_names_filter = [n.strip().lower() for n in channels_text.split(",") if n.strip()]
+
+        min_start = max_start = None
+        try:
+            if date_from_text:
+                min_start = int(datetime.strptime(date_from_text, "%Y-%m-%d").timestamp())
+            if date_to_text:
+                max_start = int((datetime.strptime(date_to_text, "%Y-%m-%d") + timedelta(days=1)).timestamp())
+        except ValueError:
+            self._hint_lbl.set_text("Nieprawidłowy format daty (oczekiwano RRRR-MM-DD)")
+
+        query_text = text or "."  # epgQuery wymaga niepustego query - "." jako "dowolny tytuł" gdy filtrujemy tylko po kanale/dacie/gatunku
+
+        def _ok(events: list) -> None:
+            if (
+                self.search_entry.get_text().strip() != text
+                or self.channels_entry.get_text().strip() != channels_text
+                or self.date_from_entry.get_text().strip() != date_from_text
+                or self.date_to_entry.get_text().strip() != date_to_text
+            ):
+                return  # zapytanie się zmieniło zanim odpowiedź wróciła
+            filtered = events
+            if channel_names_filter:
+                by_id = {ch.channel_id: ch.name.lower() for ch in
+                         (self.library.tv_channels() + self.library.radio_channels())}
+                filtered = [
+                    ev for ev in filtered
+                    if any(n in by_id.get(ev.channel_id, "") for n in channel_names_filter)
+                ]
+            if min_start is not None:
+                filtered = [ev for ev in filtered if ev.start >= min_start]
+            if max_start is not None:
+                filtered = [ev for ev in filtered if ev.start < max_start]
+            self._show_search_results(filtered)
+
+        def _err(exc: Exception) -> None:
+            self._hint_lbl.set_text(f"Błąd wyszukiwania: {exc}")
+            self.search_stack.set_visible_child_name("empty")
+            self.view_stack.set_visible_child_name("search")
+
+        self.library.search_epg(
+            query_text,
+            _ok,
+            on_err=_err,
+            channel_id=channel_id,
+            content_type=content_type,
+            limit=150,
+        )
+        return False
+
+    def _show_search_results(self, events: list) -> None:
+        while (row := self.search_listbox.get_row_at_index(0)) is not None:
+            self.search_listbox.remove(row)
+
+        channels_by_id = {
+            ch.channel_id: ch.name
+            for ch in self.library.tv_channels() + self.library.radio_channels()
+        }
+
+        if not events:
+            self._hint_lbl.set_text("Brak wyników")
+            self.search_stack.set_visible_child_name("empty")
+            self.view_stack.set_visible_child_name("search")
+            return
+
+        for ev in events:
+            ch_name = channels_by_id.get(ev.channel_id, f"Kanał {ev.channel_id}")
+            row = Gtk.ListBoxRow()
+            row.set_child(
+                EpgEventRow(
+                    self.library,
+                    ev.channel_id,
+                    ev,
+                    tag=_day_label(ev.start, int(time.time())),
+                    channel_name=ch_name,
+                    reminder_store=self.reminder_store,
+                    show_channel_name=True,
+                )
+            )
+            self.search_listbox.append(row)
+
+        self._hint_lbl.set_text(f"Wyniki: {len(events)}")
+        self.search_stack.set_visible_child_name("results")
+        self.view_stack.set_visible_child_name("search")

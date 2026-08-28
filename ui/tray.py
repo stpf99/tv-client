@@ -1,177 +1,175 @@
-"""Minimalizacja do zasobnika systemowego (tray) z podglądem OSD-info w
-menu: aktualny kanał + audycja, lista zaplanowanych przypomnień, czas
-oglądania w tej sesji.
+"""Minimalizacja do zasobnika/tla z podgladem OSD-info.
 
-GTK4 nie ma wlasnego API zasobnika (Gtk.StatusIcon usuniete w GTK3->4).
-Standardowe podejscie to AyatanaAppIndicator3 (pakiet systemowy, NIE
-biblioteka Python z pip) - dziala natywnie na KDE/XFCE/MATE, na czystym
-GNOME Shell wymaga rozszerzenia "AppIndicator and KStatusNotifierItem
-Support". Jesli pakiet nie jest zainstalowany w systemie, aplikacja ma
-dzialac normalnie po prostu bez ikony w zasobniku (nie crashowac, nie
-blokowac startu) - stad ostrozny import z fallbackiem.
+WAZNA UWAGA TECHNICZNA: klasyczne "ikony w zasobniku systemowym" na Linuksie
+(AppIndicator3/AyatanaAppIndicator3) sa zaimplementowane wylacznie jako
+biblioteka GTK3 (jej menu to Gtk3.Menu, nie Gio.Menu) - PyGObject NIE
+pozwala zaladowac GTK3 i GTK4 w tym samym procesie (gi.require_version
+rzuca ValueError, jesli namespace "Gtk" jest juz zarejestrowany w innej
+wersji), a main.py laduje GTK4 od pierwszej linii. Proba polaczenia
+AppIndicator3 z ta aplikacja dawalaby wiec ikone bez dzialajacego menu -
+nie ma sensu tego udawac ani tego dostarczac.
+
+Zamiast tego: prawdziwe minimalizowanie GTK4 "do tla" (ukrycie okna zamiast
+zamkniecia + Gio.Application.hold(), zeby proces zyl bez otwartego okna) w
+polaczeniu z powiadomieniami systemowymi (Gio.Notification - dziala wszedzie,
+bez dodatkowych zaleznosci systemowych) jako kanal informacji "co gra teraz"
+zamiast statycznej ikony w zasobniku z menu.
+
+Przywrocenie okna: klikniecie w powiadomienie (akcja app.tvh-show-window),
+lub ponowne uruchomienie aplikacji - Gio.Application z unikalnym
+application-id wykrywa juz dzialajaca instancje i po prostu aktywuje ja
+zamiast tworzyc nowy proces (standardowe zachowanie GApplication).
 """
 from __future__ import annotations
 
 import logging
 import time
-from typing import Callable, Optional
+from typing import List
 
 import gi
 
 gi.require_version("Gtk", "4.0")
-from gi.repository import Gtk, GLib, Gio  # noqa: E402
+from gi.repository import Gtk, Gio  # noqa: E402
 
 logger = logging.getLogger("ui.tray")
 
-_INDICATOR_NS = None
-AppIndicator3 = None
-for _ns, _ver in (("AyatanaAppIndicator3", "0.1"), ("AppIndicator3", "0.1")):
-    try:
-        gi.require_version(_ns, _ver)
-        from gi.repository import AyatanaAppIndicator3 as _mod  # type: ignore
-        AppIndicator3 = _mod
-        _INDICATOR_NS = _ns
-        break
-    except (ValueError, ImportError):
-        continue
-
-TRAY_AVAILABLE = AppIndicator3 is not None
-if not TRAY_AVAILABLE:
-    logger.info(
-        "AyatanaAppIndicator3/AppIndicator3 niedostępne w systemie - "
-        "zasobnik systemowy będzie wyłączony (aplikacja działa normalnie "
-        "bez niego). Na Debian/Ubuntu: apt install gir1.2-ayatanaappindicator3-0.1"
-    )
-else:
-    logger.info("Zasobnik systemowy: użyję %s", _INDICATOR_NS)
+_STATUS_NOTIFICATION_ID = "tvh-now-playing"
 
 
-class TrayController:
-    """Zarządza ikoną w zasobniku i jej menu. Bezpieczne do stworzenia
-    nawet gdy TRAY_AVAILABLE jest False - staje się wtedy no-opem."""
+class BackgroundController:
+    """Zarzadza stanem 'zminimalizowane do tla': ukrywanie/przywracanie
+    okna, trzymanie procesu przy zyciu (Gio.Application.hold/release),
+    i powiadomienie systemowe pokazujace co aktualnie gra + najblizsze
+    przypomnienie + czas ogladania, aktualizowane w miejscu (ta sama
+    notification-id, wiec nie mnozy sie w centrum powiadomien)."""
 
-    def __init__(
-        self,
-        app_id: str,
-        on_toggle_window: Callable[[], None],
-        on_quit: Callable[[], None],
-    ) -> None:
-        self._on_toggle_window = on_toggle_window
-        self._on_quit = on_quit
-        self._indicator = None
+    def __init__(self, application: Gio.Application, window: Gtk.Window) -> None:
+        self._app = application
+        self._window = window
+        self._is_hidden = False
+        self._held = False
 
         self._channel_name = ""
         self._program_title = ""
-        self._reminders: list = []
+        self._reminders: List = []
         self._watch_seconds_today = 0
 
-        if not TRAY_AVAILABLE:
-            return
-
-        try:
-            self._indicator = AppIndicator3.Indicator.new(
-                app_id,
-                "tv-symbolic",
-                AppIndicator3.IndicatorCategory.APPLICATION_STATUS,
-            )
-            self._indicator.set_status(AppIndicator3.IndicatorStatus.ACTIVE)
-            self._rebuild_menu()
-        except Exception:
-            logger.exception("Nie udało się utworzyć ikony zasobnika")
-            self._indicator = None
-
-    @property
-    def available(self) -> bool:
-        return self._indicator is not None
+        window.connect("close-request", self._on_close_request)
 
     # ------------------------------------------------------------------ #
-    # Stan pokazywany w menu
+    @property
+    def is_hidden(self) -> bool:
+        return self._is_hidden
+
+    def hide_to_background(self) -> None:
+        if self._is_hidden:
+            return
+        self._is_hidden = True
+        if not self._held:
+            self._app.hold()
+            self._held = True
+        self._window.set_visible(False)
+        self._push_status_notification(force=True)
+        logger.info("Okno zminimalizowane do tła — aplikacja działa dalej w tle")
+
+    def show_window(self) -> None:
+        self._is_hidden = False
+        self._window.set_visible(True)
+        self._window.present()
+        if self._held:
+            self._app.release()
+            self._held = False
+        try:
+            self._app.withdraw_notification(_STATUS_NOTIFICATION_ID)
+        except Exception:
+            pass
+
+    def toggle(self) -> None:
+        if self._is_hidden:
+            self.show_window()
+        else:
+            self.hide_to_background()
+
+    def _on_close_request(self, *_a) -> bool:
+        # Zamkniecie okna (X) minimalizuje do tla zamiast konczyc proces.
+        # Prawdziwe wyjscie: akcja app.tvh-quit (np. z menu aplikacji).
+        self.hide_to_background()
+        return True  # zatrzymaj domyslne niszczenie okna
+
+    def quit(self) -> None:
+        try:
+            self._app.withdraw_notification(_STATUS_NOTIFICATION_ID)
+        except Exception:
+            pass
+        if self._held:
+            self._app.release()
+            self._held = False
+        self._app.quit()
+
+    # ------------------------------------------------------------------ #
+    # Stan "co gra teraz" pokazywany w powiadomieniu, gdy zminimalizowane
     # ------------------------------------------------------------------ #
     def set_now_playing(self, channel_name: str, program_title: str) -> None:
         self._channel_name = channel_name or ""
         self._program_title = program_title or ""
-        self._rebuild_menu()
+        if self._is_hidden:
+            self._push_status_notification()
 
     def clear_now_playing(self) -> None:
         self._channel_name = ""
         self._program_title = ""
-        self._rebuild_menu()
+        if self._is_hidden:
+            self._push_status_notification()
 
     def set_reminders(self, reminders: list) -> None:
-        """reminders: lista obiektów Reminder (ui/reminders.py), posortowana
-        po czasie startu - pokazujemy najblizsze."""
         self._reminders = list(reminders)[:5]
-        self._rebuild_menu()
+        if self._is_hidden:
+            self._push_status_notification()
 
     def set_watch_seconds_today(self, seconds: int) -> None:
         self._watch_seconds_today = seconds
-        self._rebuild_menu()
+        if self._is_hidden:
+            self._push_status_notification()
 
-    # ------------------------------------------------------------------ #
-    def _rebuild_menu(self) -> None:
-        if self._indicator is None:
+    def _push_status_notification(self, force: bool = False) -> None:
+        if not self._is_hidden and not force:
             return
-        try:
-            import gi as _gi
-            _gi.require_version("Gtk", "3.0")
-        except ValueError:
-            logger.warning(
-                "Nie można załadować GTK 3.0 obok GTK 4.0 w tym samym procesie - "
-                "menu zasobnika będzie niedostępne. AppIndicator3 wymaga GTK3."
-            )
-            return
-        from gi.repository import Gtk as Gtk3  # noqa: E402
-
-        menu = Gtk3.Menu()
-
+        title = self._channel_name or "TVHeadend – zminimalizowane"
+        lines = []
         if self._channel_name:
-            label = self._channel_name
-            if self._program_title:
-                label = f"{self._channel_name} — {self._program_title}"
-        else:
-            label = "Nic nie jest odtwarzane"
-        now_item = Gtk3.MenuItem(label=label)
-        now_item.set_sensitive(False)
-        now_item.show()
-        menu.append(now_item)
-
+            lines.append(self._program_title or "(brak danych EPG)")
         hrs = self._watch_seconds_today // 3600
         mins = (self._watch_seconds_today % 3600) // 60
-        watch_item = Gtk3.MenuItem(label=f"Dziś oglądano: {hrs:d}h {mins:02d}min")
-        watch_item.set_sensitive(False)
-        watch_item.show()
-        menu.append(watch_item)
-
+        lines.append(f"Dziś oglądano: {hrs:d}h {mins:02d}min")
         if self._reminders:
-            sep = Gtk3.SeparatorMenuItem()
-            sep.show()
-            menu.append(sep)
-            header = Gtk3.MenuItem(label="Zaplanowane przypomnienia:")
-            header.set_sensitive(False)
-            header.show()
-            menu.append(header)
-            for r in self._reminders:
-                when = time.strftime("%H:%M", time.localtime(r.start))
-                item = Gtk3.MenuItem(label=f"⏰ {when}  {r.title} ({r.channel_name})")
-                item.set_sensitive(False)
-                item.show()
-                menu.append(item)
-
-        sep2 = Gtk3.SeparatorMenuItem()
-        sep2.show()
-        menu.append(sep2)
-
-        toggle_item = Gtk3.MenuItem(label="Pokaż/ukryj okno")
-        toggle_item.connect("activate", lambda *_: self._on_toggle_window())
-        toggle_item.show()
-        menu.append(toggle_item)
-
-        quit_item = Gtk3.MenuItem(label="Zakończ")
-        quit_item.connect("activate", lambda *_: self._on_quit())
-        quit_item.show()
-        menu.append(quit_item)
+            next_r = self._reminders[0]
+            when = time.strftime("%H:%M", time.localtime(next_r.start))
+            lines.append(f"Następne przypomnienie: {when} {next_r.title}")
+        body = "\n".join(lines)
 
         try:
-            self._indicator.set_menu(menu)
+            notif = Gio.Notification.new(title)
+            notif.set_body(body)
+            notif.set_priority(Gio.NotificationPriority.LOW)
+            notif.set_default_action("app.tvh-show-window")
+            self._app.send_notification(_STATUS_NOTIFICATION_ID, notif)
         except Exception:
-            logger.exception("Nie udało się zaktualizować menu zasobnika")
+            logger.exception("Nie udało się zaktualizować powiadomienia o stanie")
+
+
+def install_background_support(
+    application: Gio.Application, window: Gtk.Window
+) -> BackgroundController:
+    """Tworzy BackgroundController i podpina akcje 'app.tvh-show-window'
+    (klikniecie powiadomienia przywraca okno) oraz 'app.tvh-quit'."""
+    ctrl = BackgroundController(application, window)
+
+    show_action = Gio.SimpleAction.new("tvh-show-window", None)
+    show_action.connect("activate", lambda *_: ctrl.show_window())
+    application.add_action(show_action)
+
+    quit_action = Gio.SimpleAction.new("tvh-quit", None)
+    quit_action.connect("activate", lambda *_: ctrl.quit())
+    application.add_action(quit_action)
+
+    return ctrl

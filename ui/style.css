@@ -137,3 +137,23 @@
   background-color: @headerbar_bg_color;
   min-height: 34px;
 }
+
+/* Siatka EPG (widok grid, oś czasu) */
+.tvh-epg-row {
+  border-bottom: 1px solid alpha(@borders, 0.4);
+}
+
+.tvh-epg-block {
+  margin: 0;
+  padding: 0;
+  min-height: 1px;
+}
+
+.tvh-epg-block:hover {
+  filter: brightness(1.15);
+}
+
+.tvh-epg-now-line {
+  background-color: #e01b24;
+  opacity: 0.85;
+}

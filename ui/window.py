@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import time
+from typing import Optional
 
 import gi
 
@@ -19,6 +21,8 @@ from ui.epg_view import EpgView
 from ui.recordings_view import RecordingsView
 from ui.recent_view import RecentView
 from ui.recent import RecentStore
+from ui.reminders import ReminderStore
+from ui.tray import install_background_support
 from ui.mpris import MprisService
 
 logger = logging.getLogger("tvh.window")
@@ -39,6 +43,7 @@ class MainWindow(Adw.ApplicationWindow):
 
         self.library = TvhLibrary()
         self.recent_store = RecentStore()
+        self.reminder_store = ReminderStore(application=app)
         self.stream_ctrl = StreamController(self.library, self.recent_store)
 
         self.mpris = MprisService(
@@ -51,6 +56,13 @@ class MainWindow(Adw.ApplicationWindow):
 
         self._build_ui()
         self._connect_library_signals()
+
+        self.bg_ctrl = install_background_support(app, self)
+        self.reminder_store.connect("changed", self._on_reminders_changed)
+        self._on_reminders_changed(self.reminder_store)
+        self._watch_seconds_today = 0
+        self._watch_session_start: Optional[float] = None
+        GLib.timeout_add_seconds(60, self._tick_watch_time)
 
         cfg = load_config()
         if cfg and cfg.host:
@@ -132,7 +144,7 @@ class MainWindow(Adw.ApplicationWindow):
 
         self.live_tv_view = self._build_live_page(radio=False)
         self.live_radio_view = self._build_live_page(radio=True)
-        self.epg_view = EpgView(self.library)
+        self.epg_view = EpgView(self.library, reminder_store=self.reminder_store)
         self.recordings_view = RecordingsView(
             self.library, on_play_url=self._play_recording_url
         )
@@ -256,6 +268,11 @@ class MainWindow(Adw.ApplicationWindow):
         self.mini_channel_lbl.set_text(f"🎬 {title}")
         self.mini_icon.set_from_icon_name("media-playback-start-symbolic")
         self.mpris.update_now_playing(title, "Nagranie DVR")
+        # play_url() nie przechodzi przez LiveView.play_channel(), wiec
+        # panel listy kanalow nie chowal sie automatycznie przy odtwarzaniu
+        # nagrania (w odroznieniu od zwyklej zmiany kanalu) - ujednolicone
+        # tym samym mechanizmem/preferencja co zwykle odtwarzanie.
+        self.live_tv_view.maybe_hide_channel_list()
 
     def _play_channel_by_id(self, channel_id: int) -> None:
         ch = self.library.channels.get(channel_id)
@@ -327,6 +344,41 @@ class MainWindow(Adw.ApplicationWindow):
         self.library.connect("disconnected", self._on_disconnected)
         self.library.connect("initial-sync-done", self._on_initial_sync_done)
         self.library.connect("sync-progress", self._on_sync_progress)
+        self.reminder_store.connect("reminder-due", self._on_reminder_due)
+
+    def _on_reminder_due(self, _store, reminder) -> None:
+        # Powiadomienie systemowe wysyla juz ReminderStore._notify(); tutaj
+        # tylko log - ewentualny toast w oknie wymagalby globalnego
+        # Adw.ToastOverlay, ktorego ta wersja okna celowo nie ma (patrz
+        # notatka przy polaczeniu z bledem nizej).
+        logger.info(
+            "Przypomnienie: %s na %s o %s",
+            reminder.title,
+            reminder.channel_name,
+            time.strftime("%H:%M", time.localtime(reminder.start)),
+        )
+
+    def _on_reminders_changed(self, store) -> None:
+        if getattr(self, "bg_ctrl", None) is not None:
+            self.bg_ctrl.set_reminders(list(store.items))
+
+    def _tick_watch_time(self) -> bool:
+        # Prosty poll co 60s zamiast podpinania sie pod kazde play()/stop()
+        # w StreamController - wystarczajaco dokladne dla informacyjnego
+        # licznika "dziś oglądano" w powiadomieniu przy zminimalizowaniu.
+        ch = self.stream_ctrl.current_channel
+        if ch is not None:
+            self._watch_seconds_today += 60
+        channel_name = ch.name if ch is not None else ""
+        program_title = ""
+        if ch is not None:
+            ev = self.library.current_event_for_channel(ch.channel_id, int(time.time()))
+            if ev is not None:
+                program_title = ev.title or ""
+        if getattr(self, "bg_ctrl", None) is not None:
+            self.bg_ctrl.set_now_playing(channel_name, program_title)
+            self.bg_ctrl.set_watch_seconds_today(self._watch_seconds_today)
+        return True
 
     def _on_connected(self, _lib) -> None:
         self.status_icon.set_from_icon_name("network-idle-symbolic")

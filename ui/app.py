@@ -31,6 +31,8 @@ class TvhGnomeApp(Adw.Application):
         if not self.window:
             self.window = MainWindow(self)
         self.window.present()
+        if self.window.bg_ctrl is not None and self.window.bg_ctrl.is_hidden:
+            self.window.bg_ctrl.show_window()
 
     def _load_css(self) -> None:
         import os

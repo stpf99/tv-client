@@ -159,7 +159,7 @@ class LiveView(Gtk.Box):
         self.list_btn = self._osd_button("view-list-symbolic", self._on_toggle_channel_list)
         self.list_btn.set_tooltip_text("Lista kanałów")
 
-        self.osd_channel_icon = make_icon_widget("tv-symbolic", 48, None)
+        self.osd_channel_icon = make_icon_widget("tv-symbolic", 32, None)
         self.osd_channel_icon.set_valign(Gtk.Align.CENTER)
 
         self.channel_lbl = Gtk.Label(xalign=0, hexpand=True)
@@ -278,6 +278,8 @@ class LiveView(Gtk.Box):
         self.fullscreen_btn = self._osd_button(
             "view-fullscreen-symbolic", self._on_fullscreen_toggle
         )
+        self.minimize_btn = self._osd_button("go-down-symbolic", self._on_minimize_to_bg)
+        self.minimize_btn.set_tooltip_text("Zminimalizuj do tła (odtwarzanie w tle + powiadomienia)")
 
         spacer = Gtk.Box(hexpand=True)
 
@@ -285,7 +287,7 @@ class LiveView(Gtk.Box):
                   self.audio_btn, self.sub_btn):
             controls.append(w)
         controls.append(spacer)
-        for w in (self.prefs_btn, self.record_btn, self.fullscreen_btn):
+        for w in (self.prefs_btn, self.record_btn, self.minimize_btn, self.fullscreen_btn):
             controls.append(w)
 
         self.bottom_osd.append(prog_info)
@@ -405,10 +407,23 @@ class LiveView(Gtk.Box):
         self.play_btn.set_child(
             Gtk.Image.new_from_icon_name("media-playback-pause-symbolic")
         )
-        if self.channel_list_revealer is not None:
-            self.channel_list_revealer.set_reveal_child(False)
+        self.maybe_hide_channel_list()
         self._show_osd_temporarily()
         self._ensure_progress_timer()
+
+    def maybe_hide_channel_list(self) -> None:
+        """Chowa panel listy kanalow po wyborze - o ile wlaczone w
+        preferencjach (auto_hide_channel_list). Wywolywane po zmianie
+        kanalu ORAZ po odtworzeniu nagrania DVR (window.py woła to
+        bezposrednio, bo odtwarzanie nagrania idzie przez play_url(), nie
+        przez play_channel() - wczesniej panel zostawal otwarty tylko przy
+        odtwarzaniu nagran, co bylo niespojne)."""
+        if self.channel_list_revealer is None:
+            return
+        prefs = getattr(self, "_osd_prefs", None)
+        if prefs is not None and not getattr(prefs, "auto_hide_channel_list", True):
+            return
+        self.channel_list_revealer.set_reveal_child(False)
 
     def _update_program_info(self, channel: Optional[Channel] = None) -> None:
         ch = channel or self.stream_ctrl.current_channel
@@ -554,17 +569,11 @@ class LiveView(Gtk.Box):
         else:
             self.time_remain_lbl.set_text(f"−{remain // 60}:{remain % 60:02d}")
 
-        # Koniec audycji → odśwież EPG (tylko jesli biblioteka faktycznie
-        # zwrocila NOWE wydarzenie - w przeciwnym razie petla
-        # _update_program_info -> _refresh_progress -> _update_program_info
-        # odpalalaby sie w nieskonczonosc, gdy EPG jeszcze nie zdazyl
-        # zaktualizowac danych po zakonczeniu audycji).
+        # Koniec audycji → odśwież EPG
         if now >= ev.stop:
             ch = self.stream_ctrl.current_channel
             if ch:
-                next_ev = self.library.current_event_for_channel(ch.channel_id, int(now))
-                if next_ev is not None and next_ev is not ev:
-                    self._update_program_info(ch)
+                self._update_program_info(ch)
 
     def _ensure_progress_timer(self) -> None:
         if self._progress_source is not None:
@@ -684,6 +693,11 @@ class LiveView(Gtk.Box):
         else:
             self.window.fullscreen()
         self._show_osd_temporarily()
+
+    def _on_minimize_to_bg(self, _btn) -> None:
+        bg_ctrl = getattr(self.window, "bg_ctrl", None)
+        if bg_ctrl is not None:
+            bg_ctrl.hide_to_background()
 
     # ------------------------------------------------------------------ #
     # OSD: półprzezroczysta nakładka, auto-hide 5 s
@@ -929,6 +943,28 @@ class LiveView(Gtk.Box):
         direction_row.set_selected(0 if getattr(prefs, "osd_desc_scroll_direction", "down") == "down" else 1)
         group_osd.add(direction_row)
 
+        # --- Lista kanałów ---
+        group_list = Adw.PreferencesGroup(title="Lista kanałów")
+        page.add(group_list)
+
+        auto_hide_row = Adw.SwitchRow(title="Automatycznie chowaj listę kanałów")
+        auto_hide_row.set_subtitle("Po wybraniu kanału lub odtworzeniu nagrania — wyłącz, żeby panel zostawał otwarty")
+        auto_hide_row.set_active(getattr(prefs, "auto_hide_channel_list", True))
+        group_list.add(auto_hide_row)
+
+        # --- Wydajność / start aplikacji ---
+        group_perf = Adw.PreferencesGroup(
+            title="Wydajność",
+            description="Cache przyspiesza pokazanie listy kanałów i EPG przy starcie, "
+            "zanim zakończy się pełna synchronizacja z serwerem.",
+        )
+        page.add(group_perf)
+
+        cache_row = Adw.SwitchRow(title="Cache kanałów i EPG na dysku")
+        cache_row.set_subtitle("Wczytuje ostatnio znane dane od razu przy starcie; aktualizacja z serwera i tak leci w tle")
+        cache_row.set_active(getattr(prefs, "epg_cache_enabled", True))
+        group_perf.add(cache_row)
+
         def _save(*_a):
             dmap = {0: "auto", 1: "hw", 2: "sw"}
             omap = {
@@ -950,8 +986,13 @@ class LiveView(Gtk.Box):
                 osd_subtitle_font_pt=int(osd_font_row.get_value()),
                 osd_desc_autoscroll=autoscroll_row.get_active(),
                 osd_desc_scroll_direction="down" if direction_row.get_selected() == 0 else "up",
+                auto_hide_channel_list=auto_hide_row.get_active(),
+                epg_cache_enabled=cache_row.get_active(),
             )
             save_player_prefs(new_prefs)
+            if not cache_row.get_active():
+                from tvh import epg_cache
+                epg_cache.clear()
             self.stream_ctrl.reload_prefs()
             self.apply_osd_prefs()
             dialog.close()

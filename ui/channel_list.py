@@ -37,7 +37,7 @@ class ChannelRow(Gtk.ListBoxRow):
 
         icon = make_icon_widget(
             "tv-symbolic" if not channel.is_radio else "audio-input-microphone-symbolic",
-            42,
+            28,
             library.resolve_icon_url(channel.icon_url),
         )
         box.append(icon)
