@@ -22,6 +22,7 @@ class ChannelRow(Gtk.ListBoxRow):
         super().__init__()
         self.channel = channel
         self.on_favorite_toggled = on_favorite_toggled
+        self._icon_url = library.resolve_icon_url(channel.icon_url)
         self.add_css_class("tvh-channel-row")
 
         box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
@@ -30,17 +31,17 @@ class ChannelRow(Gtk.ListBoxRow):
         box.set_margin_start(10)
         box.set_margin_end(10)
 
-        number_lbl = Gtk.Label(label=str(channel.number or "—"))
-        number_lbl.add_css_class("dim-label")
-        number_lbl.set_width_chars(4)
-        box.append(number_lbl)
+        self.number_lbl = Gtk.Label(label=str(channel.number or "—"))
+        self.number_lbl.add_css_class("dim-label")
+        self.number_lbl.set_width_chars(4)
+        box.append(self.number_lbl)
 
-        icon = make_icon_widget(
+        self.icon_widget = make_icon_widget(
             "tv-symbolic" if not channel.is_radio else "audio-input-microphone-symbolic",
             28,
-            library.resolve_icon_url(channel.icon_url),
+            self._icon_url,
         )
-        box.append(icon)
+        box.append(self.icon_widget)
 
         # Kolumna tekstowa MUSI miec ograniczona/elastyczna szerokosc i
         # etykiety z ellipsize, inaczej dlugie nazwy kanalow rozpychaja caly
@@ -49,13 +50,13 @@ class ChannelRow(Gtk.ListBoxRow):
         text_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
         text_box.set_hexpand(True)
 
-        title_lbl = Gtk.Label(label=channel.name, xalign=0)
-        title_lbl.add_css_class("title-4")
-        title_lbl.set_ellipsize(Pango.EllipsizeMode.END)
-        title_lbl.set_hexpand(True)
-        title_lbl.set_max_width_chars(1)  # wraz z hexpand wymusza zawijanie do dostepnej szerokosci, nie do tresci
-        title_lbl.set_tooltip_text(channel.name)
-        text_box.append(title_lbl)
+        self.title_lbl = Gtk.Label(label=channel.name, xalign=0)
+        self.title_lbl.add_css_class("title-4")
+        self.title_lbl.set_ellipsize(Pango.EllipsizeMode.END)
+        self.title_lbl.set_hexpand(True)
+        self.title_lbl.set_max_width_chars(1)  # wraz z hexpand wymusza zawijanie do dostepnej szerokosci, nie do tresci
+        self.title_lbl.set_tooltip_text(channel.name)
+        text_box.append(self.title_lbl)
 
         self.program_lbl = Gtk.Label(xalign=0)
         self.program_lbl.add_css_class("dim-label")
@@ -77,6 +78,32 @@ class ChannelRow(Gtk.ListBoxRow):
 
         self.set_child(box)
         self.refresh_program(library)
+
+    def update_channel(self, channel: Channel, library: TvhLibrary) -> None:
+        """Odswieza istniejacy wiersz nowymi danymi kanalu (numer, nazwa,
+        ikona, EPG) bez niszczenia/tworzenia widgetow od nowa - wolane z
+        ChannelListView.reload() dla kanalow, ktore juz maja wiersz, zeby
+        uniknac kosztu rekonstrukcji calej listy przy kazdej aktualizacji."""
+        old_channel = self.channel
+        self.channel = channel
+
+        if old_channel.number != channel.number:
+            self.number_lbl.set_label(str(channel.number or "—"))
+        if old_channel.name != channel.name:
+            self.title_lbl.set_label(channel.name)
+            self.title_lbl.set_tooltip_text(channel.name)
+
+        new_icon_url = library.resolve_icon_url(channel.icon_url)
+        if new_icon_url != self._icon_url:
+            from ui.icon_cache import update_icon_widget
+            self._icon_url = new_icon_url
+            update_icon_widget(self.icon_widget, new_icon_url)
+
+        if old_channel.current_event_id != channel.current_event_id:
+            self.refresh_program(library)
+
+        if is_favorite(channel.channel_id, channel.is_radio) != is_favorite(old_channel.channel_id, old_channel.is_radio):
+            self._sync_fav_icon()
 
     def _sync_fav_icon(self) -> None:
         active = is_favorite(self.channel.channel_id, self.channel.is_radio)
@@ -138,6 +165,11 @@ class ChannelListView(Gtk.Box):
         self.on_play = on_play
         self.active_tag_id: Optional[int] = None
         self._tag_buttons: Dict[Optional[int], Gtk.ToggleButton] = {}
+        # Indeks channel_id -> ChannelRow, zeby reload() mogl diffowac
+        # zamiast burzyc i budowac cala liste od zera przy kazdym
+        # channels-changed, a _refresh_row() mogl znalezc wiersz w O(1)
+        # zamiast liniowego przeszukiwania Gtk.ListBox.
+        self._rows: Dict[int, ChannelRow] = {}
 
         search = Gtk.SearchEntry(placeholder_text="Szukaj kanału…")
         search.set_margin_top(8)
@@ -180,11 +212,39 @@ class ChannelListView(Gtk.Box):
         self.reload()
 
     def reload(self) -> None:
-        while (row := self.listbox.get_row_at_index(0)) is not None:
-            self.listbox.remove(row)
         channels = self.library.radio_channels() if self.radio else self.library.tv_channels()
+        new_ids = [ch.channel_id for ch in channels]
+        new_id_set = set(new_ids)
+
+        # Usun wiersze kanalow, ktorych juz nie ma (usuniete na serwerze
+        # albo przelaczyly sie miedzy TV/Radio).
+        for old_id in list(self._rows.keys()):
+            if old_id not in new_id_set:
+                row = self._rows.pop(old_id)
+                self.listbox.remove(row)
+
+        # Dodaj/zaktualizuj: kanaly nieznane dostaja nowy ChannelRow,
+        # znane dostaja odswiezone dane (numer/nazwa/ikona/EPG) na
+        # istniejacym widgecie zamiast rekonstrukcji.
         for ch in channels:
-            self.listbox.append(ChannelRow(ch, self.library, on_favorite_toggled=self._on_fav_changed))
+            row = self._rows.get(ch.channel_id)
+            if row is None:
+                row = ChannelRow(ch, self.library, on_favorite_toggled=self._on_fav_changed)
+                self._rows[ch.channel_id] = row
+                self.listbox.append(row)
+            else:
+                row.update_channel(ch, self.library)
+
+        # Kolejnosc: Gtk.ListBox nie ma taniego "przesun wiersz na pozycje
+        # N", wiec zamiast tego przestawiamy tylko wiersze, ktore faktycznie
+        # sa nie na swoim miejscu wzgledem docelowej kolejnosci (typowo
+        # zero lub kilka przy zwyklej aktualizacji EPG/nazw, nie setki).
+        for target_index, ch_id in enumerate(new_ids):
+            row = self._rows[ch_id]
+            current_index = row.get_index()
+            if current_index != target_index:
+                self.listbox.remove(row)
+                self.listbox.insert(row, target_index)
 
     def _on_fav_changed(self) -> None:
         # Jeśli filtr "Ulubione" jest aktywny, odznaczenie gwiazdki musi
@@ -193,12 +253,9 @@ class ChannelListView(Gtk.Box):
             self.listbox.invalidate_filter()
 
     def _refresh_row(self, channel_id: int) -> None:
-        i = 0
-        while (row := self.listbox.get_row_at_index(i)) is not None:
-            if isinstance(row, ChannelRow) and row.channel.channel_id == channel_id:
-                row.refresh_program(self.library)
-                break
-            i += 1
+        row = self._rows.get(channel_id)
+        if row is not None:
+            row.refresh_program(self.library)
 
     # ------------------------------------------------------------------ #
     # Filtrowanie: tekst wyszukiwania + wybrany tag (SD/HD/Radio/...)
