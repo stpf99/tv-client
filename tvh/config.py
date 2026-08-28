@@ -97,6 +97,8 @@ class PlayerPreferences:
         osd_desc_autoscroll: bool = False,
         osd_desc_scroll_direction: str = "down",
         osd_top_bar_font_pt: int = 20,
+        auto_hide_channel_list: bool = True,
+        epg_cache_enabled: bool = True,
     ):
         self.decoder_pref = decoder_pref if decoder_pref in ("auto", "hw", "sw") else "auto"
         self.video_output = (
@@ -123,6 +125,16 @@ class PlayerPreferences:
         # Rozmiar czcionki gornego paska OSD (nazwa kanalu + zegar) -
         # domyslny title-2 z libadwaita bywa za maly na duzym ekranie/TV.
         self.osd_top_bar_font_pt = int(osd_top_bar_font_pt) if osd_top_bar_font_pt else 20
+        # Czy panel listy kanalow ma sam sie chowac po wybraniu kanalu /
+        # nagrania. Wylaczenie zostawia panel otwarty na stale (uzytkownik
+        # zamyka go recznie przyciskiem/list_btn).
+        self.auto_hide_channel_list = bool(auto_hide_channel_list)
+        # Czy kanaly i EPG maja byc cache'owane na dysku i wczytywane od
+        # razu przy starcie (przed pelna synchronizacja z serwerem), zeby
+        # skrocic czas do pierwszego uzytecznego widoku. Synchronizacja z
+        # serwerem zawsze leci normalnie w tle niezaleznie od tego ustawienia
+        # - ono wplywa tylko na to, czy jest tez wstepne wczytanie z dysku.
+        self.epg_cache_enabled = bool(epg_cache_enabled)
 
     def to_dict(self) -> dict:
         return {
@@ -136,6 +148,8 @@ class PlayerPreferences:
             "osd_desc_autoscroll": self.osd_desc_autoscroll,
             "osd_desc_scroll_direction": self.osd_desc_scroll_direction,
             "osd_top_bar_font_pt": self.osd_top_bar_font_pt,
+            "auto_hide_channel_list": self.auto_hide_channel_list,
+            "epg_cache_enabled": self.epg_cache_enabled,
         }
 
     @classmethod
@@ -151,6 +165,8 @@ class PlayerPreferences:
             osd_desc_autoscroll=d.get("osd_desc_autoscroll", False),
             osd_desc_scroll_direction=d.get("osd_desc_scroll_direction", "down"),
             osd_top_bar_font_pt=d.get("osd_top_bar_font_pt", 20),
+            auto_hide_channel_list=d.get("auto_hide_channel_list", True),
+            epg_cache_enabled=d.get("epg_cache_enabled", True),
         )
 
     def rank_language(self, lang: Optional[str], preferred: List[str]) -> int:

@@ -21,6 +21,7 @@ from gi.repository import GObject, GLib  # noqa: E402
 from .async_bridge import bridge
 from .client import HtspClient, HtspAuthError, HtspError
 from .models import Channel, ChannelTag, DvrConfig, EpgEvent, Recording
+from . import epg_cache
 
 logger = logging.getLogger("tvh.library")
 
@@ -81,6 +82,10 @@ class TvhLibrary(GObject.GObject):
         self._sync_event_count = 0
         self._sync_progress_scheduled = False
         self._initial_sync_done = False
+        # Czy biezace dane w self.channels/events_by_channel pochodza
+        # (jeszcze) tylko z cache dyskowego, a nie z serwera - do
+        # ewentualnego pokazania w UI ("dane wstepne, ladowanie...").
+        self.showing_cached_data = False
 
         c = self.client
         c.on_channel_add = lambda m: bridge.emit_to_gtk(self._on_channel_add, m)
@@ -121,6 +126,8 @@ class TvhLibrary(GObject.GObject):
         self.host, self.port, self.username = host, port, username
         self.http_port = http_port or 9981
         self.password = password or ""
+
+        self._maybe_load_disk_cache(host, port)
 
         async def _do():
             await self.client.connect(host, port)
@@ -280,11 +287,56 @@ class TvhLibrary(GObject.GObject):
         self.recordings.pop(m.get("id") or m.get("entryId"), None)
         self.emit("recordings-changed")
 
+    def _maybe_load_disk_cache(self, host: str, port: int) -> None:
+        """Wczytuje kanaly+EPG z cache dyskowego (jesli wlaczone w
+        preferencjach i cache istnieje/jest swiezy) i wypelnia nimi
+        biezacy stan PRZED nawiazaniem polaczenia sieciowego - tak ze
+        pierwszy render list kanalow/EPG w UI moze nastapic natychmiast,
+        zamiast czekac na pelna synchronizacje z serwera. Prawdziwe dane z
+        serwera i tak normalnie naplyna i nadpisza to (po channel_id/
+        event_id), wiec to jest czysto kosmetyczne przyspieszenie
+        postrzeganego czasu startu, nie zamiennik synchronizacji."""
+        from tvh.config import load_player_prefs
+        prefs = load_player_prefs()
+        if not getattr(prefs, "epg_cache_enabled", True):
+            return
+
+        result = epg_cache.load(host, port)
+        if result is None:
+            return
+        channels, events = result
+        for ch in channels:
+            self.channels[ch.channel_id] = ch
+        for ev in events:
+            self.events[ev.event_id] = ev
+            self.events_by_channel.setdefault(ev.channel_id, []).append(ev)
+        for lst in self.events_by_channel.values():
+            lst.sort(key=lambda e: e.start)
+        self.showing_cached_data = True
+        logger.info(
+            "Wczytano z cache: %d kanałów, %d zdarzeń EPG (wstępny widok przed synchronizacją)",
+            len(channels), len(events),
+        )
+        self.emit("channels-changed")
+        for ch_id in self.events_by_channel:
+            self.emit("epg-changed", ch_id)
+
+    def _save_disk_cache(self) -> None:
+        from tvh.config import load_player_prefs
+        prefs = load_player_prefs()
+        if not getattr(prefs, "epg_cache_enabled", True):
+            return
+        if not self.host:
+            return
+        epg_cache.save(self.host, self.port, list(self.channels.values()), self.events_by_channel)
+
     def _on_initial_sync(self) -> None:
         self._initial_sync_done = True
+        self.showing_cached_data = False
         # finalny, pelny rebuild widokow po zakonczeniu synchronizacji
         self.emit("channels-changed")
         self.emit("initial-sync-done")
+        self._save_disk_cache()
 
     def _on_disconnect(self) -> None:
         self.emit("disconnected")
@@ -435,31 +487,50 @@ class TvhLibrary(GObject.GObject):
         on_ok: Callable[[list], None],
         on_err: Optional[Callable[[Exception], None]] = None,
         channel_id: Optional[int] = None,
-        limit: int = 50,
+        tag_id: Optional[int] = None,
+        content_type: Optional[int] = None,
+        min_duration: Optional[int] = None,
+        max_duration: Optional[int] = None,
+        limit: int = 100,
     ) -> None:
         """Przeszukuje EPG na serwerze (epgQuery – pelnotekstowe, poza
-        oknem zsynchronizowanych zdarzen w pamieci klienta).
+        oknem zsynchronizowanych zdarzen w pamieci klienta), z opcjonalnym
+        filtrem kanalu/tagu(grupy kanalow)/kategorii gatunku/dlugosci.
 
-        epgQuery zwraca tylko `eventIds`; dla kazdego ID, ktorego nie mamy
-        juz w cache (`self.events`), dociagamy pelne dane przez getEvents.
-        Wynik: lista EpgEvent posortowana po czasie startu (rosnaco).
+        Prosimy o full=1 (pelne dane eventow w odpowiedzi zamiast samych
+        eventIds), ale defensywnie obslugujemy oba ksztalty odpowiedzi -
+        serwer moze zwrocic albo "events" (pelne msg[]), albo tylko
+        "eventIds" (starsze wersje / gdy full zostanie zignorowane) - w tym
+        drugim przypadku dociagamy brakujace przez getEvents.
         """
         async def _run() -> list:
-            resp = await self.client.epg_query(query, channel_id=channel_id, limit=limit)
-            ids = resp.get("eventIds") or []
+            resp = await self.client.epg_query(
+                query,
+                channel_id=channel_id,
+                tag_id=tag_id,
+                content_type=content_type,
+                min_duration=min_duration,
+                max_duration=max_duration,
+                limit=limit,
+                full=True,
+            )
             out: list = []
-            for eid in ids:
-                cached = self.events.get(eid)
-                if cached is not None:
-                    out.append(cached)
-                    continue
-                try:
-                    ev_resp = await self.client.get_events(event_id=eid, num_following=0)
-                except Exception:
-                    continue
-                events_raw = ev_resp.get("events") or ([ev_resp] if ev_resp.get("eventId") else [])
+            events_raw = resp.get("events")
+            if events_raw:
                 for m in events_raw:
-                    if m.get("eventId") == eid or m.get("eventId") is None:
+                    out.append(EpgEvent.from_htsp(m))
+            else:
+                ids = resp.get("eventIds") or []
+                for eid in ids:
+                    cached = self.events.get(eid)
+                    if cached is not None:
+                        out.append(cached)
+                        continue
+                    try:
+                        ev_resp = await self.client.get_events(event_id=eid, num_following=0)
+                    except Exception:
+                        continue
+                    for m in (ev_resp.get("events") or []):
                         out.append(EpgEvent.from_htsp(m))
                         break
             out.sort(key=lambda e: e.start)

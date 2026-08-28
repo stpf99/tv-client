@@ -255,10 +255,30 @@ class HtspClient:
             params["eventId"] = event_id
         return await self.send_and_wait("getEvents", params)
 
-    async def epg_query(self, query: str, channel_id: Optional[int] = None, limit: int = 50) -> dict:
+    async def epg_query(
+        self,
+        query: str,
+        channel_id: Optional[int] = None,
+        tag_id: Optional[int] = None,
+        content_type: Optional[int] = None,
+        min_duration: Optional[int] = None,
+        max_duration: Optional[int] = None,
+        limit: int = 50,
+        full: bool = False,
+    ) -> dict:
         params: Dict[str, Any] = {"query": query, "limit": limit}
         if channel_id is not None:
             params["channelId"] = channel_id
+        if tag_id is not None:
+            params["tagId"] = tag_id
+        if content_type is not None:
+            params["contentType"] = content_type
+        if min_duration is not None:
+            params["minduration"] = min_duration
+        if max_duration is not None:
+            params["maxduration"] = max_duration
+        if full:
+            params["full"] = 1
         return await self.send_and_wait("epgQuery", params)
 
     # ------------------------------------------------------------------ #

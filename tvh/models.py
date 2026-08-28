@@ -95,7 +95,11 @@ class EpgEvent:
     # pola pomocnicze do PVR / serii
     series_link_id: Optional[int] = None
     episode_id: Optional[str] = None
-    content_type: Optional[int] = None  # DVB genre code z HTSP "contentType"
+    # DVB content type (ETSI EN 300 468 tabela 28, "content_nibble_level_1"
+    # w gornym nibble'u bajtu) - kategoria gatunku audycji (Film/Serial,
+    # Rozrywka, Sport, itd.) uzywana do kolorowania siatki EPG i filtra
+    # gatunkow. None gdy serwer nie przyslal.
+    content_type: Optional[int] = None
 
     @classmethod
     def from_htsp(cls, m: dict) -> "EpgEvent":
