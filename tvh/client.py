@@ -104,6 +104,10 @@ class HtspClient:
         self.server_version = resp.get("serverversion", "")
         self.htsp_version = resp.get("htspversion", 0)
         self.challenge = resp.get("challenge", b"") or b""
+        logger.info(
+            "Serwer: %s %s, HTSP v%s (wymagane v41+ dla channelIdStr/HbbTV)",
+            self.server_name, self.server_version, self.htsp_version,
+        )
         return resp
 
     async def authenticate(self, username: str, password: str = "") -> None:
@@ -343,3 +347,16 @@ class HtspClient:
         if dvr_entry_id is not None:
             params["dvrId"] = dvr_entry_id
         return await self.send_and_wait("getTicket", params)
+
+    # ------------------------------------------------------------------ #
+    # JSON API przez HTSP (metoda "api" - most do tego samego API co
+    # /api/... po HTTP w webui, patrz docs.tvheadend.org/.../json-api).
+    # Pozwala odpytac endpointy typu channel/grid, service/streams itp.
+    # bez otwierania osobnego polaczenia HTTP.
+    # ------------------------------------------------------------------ #
+    async def api(self, path: str, args: Optional[dict] = None) -> dict:
+        resp = await self.send_and_wait("api", {"path": path, "args": dict(args or {})})
+        response = resp.get("response")
+        # Tvheadend czasem zwraca zagnieżdżoną mapę pod "response", a
+        # czasem (starsze wersje) klucze bezpośrednio w odpowiedzi.
+        return response if isinstance(response, dict) else resp

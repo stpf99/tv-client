@@ -15,6 +15,10 @@ class Channel:
     is_radio: bool = False
     current_event_id: Optional[int] = None
     next_event_id: Optional[int] = None
+    # Pelny UUID kanalu (HTSP "channelIdStr", od HTSPv41) - potrzebny do
+    # zapytan JSON API (patrz tvh/hbbtv.py) ktore operuja na uuid, nie na
+    # numerycznym channelId. Moze byc pusty dla starszych serwerow.
+    uuid: str = ""
 
     @classmethod
     def from_htsp(cls, m: dict) -> "Channel":
@@ -54,6 +58,7 @@ class Channel:
             name=m.get("channelName", "") or m.get("name", ""),
             number=number,
             icon_url=m.get("channelIcon"),
+            uuid=str(m.get("channelIdStr") or ""),
             # UWAGA: pole HTSP dla tagow kanalu nazywa sie "tags" (lista
             # tagId-ow), NIE "channelTags" - zla nazwa pola powodowala ze
             # tag_ids bylo zawsze puste, co psulo zarowno heurystyke radio/TV

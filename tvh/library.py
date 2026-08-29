@@ -23,12 +23,15 @@ from .async_bridge import bridge
 from .client import HtspClient, HtspAuthError, HtspError
 from .models import Channel, ChannelTag, DvrConfig, EpgEvent, Recording
 from . import epg_cache
+from .hbbtv import ChannelHbbtvState, parse_hbbtv_apps_from_channel_services
 
 logger = logging.getLogger("tvh.library")
 
 # Handler muxpkt: (subscription_id, msg_dict) -> None
 # Wywolywany z watku asyncio – musi byc thread-safe.
 MuxpktHandler = Callable[[int, dict], None]
+
+
 
 
 class TvhLibrary(GObject.GObject):
@@ -48,6 +51,9 @@ class TvhLibrary(GObject.GObject):
         "stream-started": (GObject.SignalFlags.RUN_FIRST, None, (object, object)),
         "stream-stopped": (GObject.SignalFlags.RUN_FIRST, None, (object,)),
         "signal-status": (GObject.SignalFlags.RUN_FIRST, None, (object,)),
+        # channel_id - wyemitowane gdy zmienila sie lista wykrytych
+        # aplikacji HbbTV dla danego kanalu (patrz hbbtv.py)
+        "hbbtv-changed": (GObject.SignalFlags.RUN_FIRST, None, (object,)),
     }
 
     def __init__(self) -> None:
@@ -79,6 +85,13 @@ class TvhLibrary(GObject.GObject):
         # Bezposredni handler pakietow mediow (watku asyncio → appsrc).
         # NIE emitujemy sygnalu GObject na kazdy muxpkt.
         self._muxpkt_handler: Optional[MuxpktHandler] = None
+
+        # --- Wykrywanie HbbTV --------------------------------------------
+        # Tvheadend parsuje AIT po swojej stronie (Parse HbbTV data) i
+        # dolacza wynik bezposrednio do normalnej wiadomosci channelAdd/
+        # channelUpdate (patrz _update_hbbtv_from_channel_msg) - stan
+        # cache'owany per channel_id, sygnal "hbbtv-changed" informuje UI.
+        self._hbbtv_states: Dict[int, ChannelHbbtvState] = {}
 
         # --- Debouncing/batching sygnalow -------------------------------
         # Tvheadend podczas wstepnej synchronizacji wysyla kanaly/zdarzenia
@@ -181,6 +194,7 @@ class TvhLibrary(GObject.GObject):
         self._sync_channel_count += 1
         if any("radio" in self.tags[tid].name.lower() for tid in ch.tag_ids if tid in self.tags):
             ch.is_radio = True
+        self._update_hbbtv_from_channel_msg(ch.channel_id, m)
         self._schedule_channels_changed()
         self._schedule_sync_progress()
         # channelUpdate z nowym eventId = zmiana aktualnej audycji → odśwież EPG
@@ -188,7 +202,9 @@ class TvhLibrary(GObject.GObject):
             self._schedule_epg_changed(ch.channel_id)
 
     def _on_channel_delete(self, m: dict) -> None:
-        self.channels.pop(m.get("channelId"), None)
+        channel_id = m.get("channelId")
+        self.channels.pop(channel_id, None)
+        self._hbbtv_states.pop(channel_id, None)
         self._channels_version += 1
         self._schedule_channels_changed()
 
@@ -463,6 +479,65 @@ class TvhLibrary(GObject.GObject):
 
     def unsubscribe(self, subscription_id: int) -> None:
         bridge.call(self.client.unsubscribe(subscription_id))
+
+    # ------------------------------------------------------------------ #
+    # Wykrywanie HbbTV - wymaga "Parse HbbTV data" w Tvheadend (per-muxer
+    # / DVB input). Serwer sam parsuje AIT i dolacza wynik ("hbbtv" per
+    # serwis) BEZPOSREDNIO do normalnej, asynchronicznej wiadomosci
+    # channelAdd/channelUpdate (pole "services" - patrz src/htsp_server.c:
+    # htsp_build_channel() po stronie serwera). Zero dodatkowych zapytan:
+    # parsujemy to w _on_channel_add/_update_hbbtv_from_channel_msg ponizej.
+    #
+    # (Poprzednia wersja robila to przez dwa zapytania JSON API po HTSP -
+    # api("channel/grid", {"uuid":...}) + api("service/streams", {"uuid":
+    # ...}) - co bylo zle: channel/grid nie ma parametru "uuid" (ignorowany,
+    # zawsze zwracal ten sam, przypadkowy pierwszy kanal z domyslnej,
+    # nieprzefiltrowanej listy), a nastepujacy po nim service/streams z
+    # takim "losowym" uuid serwisu nieuchronnie dostawal EINVAL, co serwer
+    # raportuje jako goly string "Bad request" - identycznie dla kazdego
+    # kanalu. service/streams wymaga tez uprawnien ADMIN. Patrz tvh/hbbtv.py
+    # dla pelnego opisu.)
+    # ------------------------------------------------------------------ #
+    def get_hbbtv_state(self, channel_id: int) -> Optional[ChannelHbbtvState]:
+        """Ostatni znany stan (lista aplikacji) dla kanalu. None jesli
+        jeszcze nie przyszla zadna wiadomosc channelAdd/channelUpdate dla
+        tego kanalu (patrz _update_hbbtv_from_channel_msg)."""
+        return self._hbbtv_states.get(channel_id)
+
+    def _update_hbbtv_from_channel_msg(self, channel_id: int, m: dict) -> None:
+        """Wywolywane z _on_channel_add dla kazdej wiadomosci channelAdd/
+        channelUpdate - parsuje pole "hbbtv" z m["services"] (patrz
+        tvh/hbbtv.py: parse_hbbtv_apps_from_channel_services) i aktualizuje
+        cache, emitujac "hbbtv-changed" tylko gdy lista aplikacji faktycznie
+        sie zmienila (np. serwer dopiero co sparsowal AIT)."""
+        apps = parse_hbbtv_apps_from_channel_services(m.get("services"))
+        old_state = self._hbbtv_states.get(channel_id)
+        new_state = ChannelHbbtvState(channel_id=channel_id, apps=apps, fetched=True)
+        self._hbbtv_states[channel_id] = new_state
+        if old_state is None or [a.uid for a in old_state.apps] != [a.uid for a in new_state.apps]:
+            self.emit("hbbtv-changed", channel_id)
+
+    def fetch_hbbtv_for_channel(self, channel: Channel) -> None:
+        """Zachowane dla zgodnosci z UI (ui/channel_list.py wywoluje to przy
+        rozwijaniu wiersza kanalu). Stan jest juz wypelniany na biezaco z
+        channelAdd/channelUpdate (patrz wyzej), wiec zwykle nie ma tu nic do
+        zrobienia - jedyny realny przypadek to kanal, dla ktorego jeszcze
+        nie przyszla zadna wiadomosc (np. UI zbudowane przed synchronizacja);
+        wtedy zapisujemy pusty, "sprawdzony" stan zeby UI nie czekalo w
+        nieskonczonosc."""
+        if channel.channel_id not in self._hbbtv_states:
+            self._hbbtv_states[channel.channel_id] = ChannelHbbtvState(
+                channel_id=channel.channel_id, fetched=True,
+            )
+
+    def rescan_hbbtv_for_channel(self, channel: Channel) -> None:
+        """Przycisk "odśwież" w UI. Dane HbbTV przychodza same przy kolejnym
+        channelUpdate (np. gdy serwer dopiero co sparsowal AIT po stronie
+        DVB) - tu tylko czyscimy cache, zeby UI od razu pokazalo brak danych
+        zamiast starych, zamiast wykonywac zapytanie JSON API (patrz komentarz
+        wyzej, dlaczego to podejscie bylo zawodne)."""
+        self._hbbtv_states.pop(channel.channel_id, None)
+        self.emit("hbbtv-changed", channel.channel_id)
 
     def resolve_icon_url(self, raw: Optional[str]) -> Optional[str]:
         """Zamienia surowa wartosc channelIcon/tagIcon z HTSP na absolutny URL.
