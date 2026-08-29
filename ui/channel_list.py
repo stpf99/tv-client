@@ -12,18 +12,79 @@ from gi.repository import Gtk, Pango  # noqa: E402
 from tvh.library import TvhLibrary
 from tvh.models import Channel
 from tvh.config import is_favorite, toggle_favorite
+from tvh.hbbtv import HbbtvApp
 from ui.icon_cache import make_icon_widget
 
 FAV_TAG = "__favorites__"  # sentinel dla wirtualnego "tagu" Ulubione w chipach
 
 
+class HbbtvAppRow(Gtk.ListBoxRow):
+    """Pojedyncza pozycja w podliscie aplikacji HbbTV danego kanalu -
+    pokazuje nazwe aplikacji i pozwala otworzyc jej URL (np. w zewnetrznej
+    przegladarce/WebKit) klikniciem."""
+
+    def __init__(self, app: HbbtvApp, on_activate=None) -> None:
+        super().__init__()
+        self.app = app
+        self.on_activate = on_activate
+        self.add_css_class("tvh-hbbtv-app-row")
+
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        box.set_margin_top(4)
+        box.set_margin_bottom(4)
+        box.set_margin_start(34)  # wciecie - sygnalizuje ze to sub-pozycja kanalu
+        box.set_margin_end(10)
+
+        icon = Gtk.Image.new_from_icon_name("applications-internet-symbolic")
+        icon.set_pixel_size(16)
+        box.append(icon)
+
+        text_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+        text_box.set_hexpand(True)
+
+        name_lbl = Gtk.Label(label=app.display_name, xalign=0)
+        name_lbl.add_css_class("caption-heading")
+        name_lbl.set_ellipsize(Pango.EllipsizeMode.END)
+        name_lbl.set_hexpand(True)
+        name_lbl.set_max_width_chars(1)
+        text_box.append(name_lbl)
+
+        detail = f"[{app.section}]" if app.section else ""
+        if app.lang:
+            detail = f"{detail} {app.lang}".strip()
+        if app.visibility:
+            detail = f"{detail} · {app.visibility}".strip(" ·")
+        if app.url:
+            detail = f"{detail} · {app.url}".strip(" ·")
+        detail_lbl = Gtk.Label(label=detail, xalign=0)
+        detail_lbl.add_css_class("dim-label")
+        detail_lbl.add_css_class("caption")
+        detail_lbl.set_ellipsize(Pango.EllipsizeMode.END)
+        detail_lbl.set_hexpand(True)
+        detail_lbl.set_max_width_chars(1)
+        detail_lbl.set_tooltip_text(app.url or "")
+        text_box.append(detail_lbl)
+
+        box.append(text_box)
+        self.set_child(box)
+        self.set_activatable(bool(app.url))
+
+    def activate_app(self) -> None:
+        if self.on_activate and self.app.url:
+            self.on_activate(self.app)
+
+
 class ChannelRow(Gtk.ListBoxRow):
-    def __init__(self, channel: Channel, library: TvhLibrary, on_favorite_toggled=None) -> None:
+    def __init__(self, channel: Channel, library: TvhLibrary, on_favorite_toggled=None,
+                 on_hbbtv_app_activate=None) -> None:
         super().__init__()
         self.channel = channel
         self.on_favorite_toggled = on_favorite_toggled
+        self.on_hbbtv_app_activate = on_hbbtv_app_activate
         self._icon_url = library.resolve_icon_url(channel.icon_url)
         self.add_css_class("tvh-channel-row")
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
 
         box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
         box.set_margin_top(6)
@@ -50,13 +111,23 @@ class ChannelRow(Gtk.ListBoxRow):
         text_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
         text_box.set_hexpand(True)
 
+        title_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
         self.title_lbl = Gtk.Label(label=channel.name, xalign=0)
         self.title_lbl.add_css_class("title-4")
         self.title_lbl.set_ellipsize(Pango.EllipsizeMode.END)
         self.title_lbl.set_hexpand(True)
         self.title_lbl.set_max_width_chars(1)  # wraz z hexpand wymusza zawijanie do dostepnej szerokosci, nie do tresci
         self.title_lbl.set_tooltip_text(channel.name)
-        text_box.append(self.title_lbl)
+        title_row.append(self.title_lbl)
+
+        # Znacznik "ma HbbTV" - widoczny dopiero po wykryciu AIT (patrz
+        # set_hbbtv_apps/ChannelListView._on_hbbtv_changed).
+        self.hbbtv_badge = Gtk.Label(label="HbbTV")
+        self.hbbtv_badge.add_css_class("tvh-hbbtv-badge")
+        self.hbbtv_badge.add_css_class("caption")
+        self.hbbtv_badge.set_visible(False)
+        title_row.append(self.hbbtv_badge)
+        text_box.append(title_row)
 
         self.program_lbl = Gtk.Label(xalign=0)
         self.program_lbl.add_css_class("dim-label")
@@ -76,8 +147,62 @@ class ChannelRow(Gtk.ListBoxRow):
         self._sync_fav_icon()
         box.append(self.fav_btn)
 
-        self.set_child(box)
+        # Przycisk rozwijania sublisty aplikacji HbbTV - ukryty dopoki nie
+        # wykryto zadnej aplikacji na kanale.
+        self.hbbtv_expander_btn = Gtk.ToggleButton()
+        self.hbbtv_expander_btn.add_css_class("flat")
+        self.hbbtv_expander_btn.add_css_class("circular")
+        self.hbbtv_expander_btn.set_valign(Gtk.Align.CENTER)
+        self.hbbtv_expander_btn.set_icon_name("pan-down-symbolic")
+        self.hbbtv_expander_btn.set_tooltip_text("Aplikacje HbbTV")
+        self.hbbtv_expander_btn.set_visible(False)
+        self.hbbtv_expander_btn.connect("toggled", self._on_hbbtv_expander_toggled)
+        box.append(self.hbbtv_expander_btn)
+
+        outer.append(box)
+
+        # Sublista pozycji "tv-hbbtv"/"radio-hbbtv" - dodatkowe strumienie
+        # (aplikacje HbbTV) wykryte dla TEGO kanalu, pod jego wierszem.
+        self.hbbtv_list = Gtk.ListBox()
+        self.hbbtv_list.add_css_class("tvh-hbbtv-sublist")
+        self.hbbtv_list.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.hbbtv_list.set_visible(False)
+        self.hbbtv_list.connect("row-activated", self._on_hbbtv_row_activated)
+        outer.append(self.hbbtv_list)
+
+        self.set_child(outer)
         self.refresh_program(library)
+        self._apps: list[HbbtvApp] = []
+
+    def set_hbbtv_apps(self, apps: list) -> None:
+        """Aktualizuje znacznik 'HbbTV' i sublista pozycji pod kanalem."""
+        self._apps = list(apps)
+        has_apps = bool(self._apps)
+        self.hbbtv_badge.set_visible(has_apps)
+        self.hbbtv_expander_btn.set_visible(has_apps)
+        if not has_apps:
+            self.hbbtv_expander_btn.set_active(False)
+
+        child = self.hbbtv_list.get_first_child()
+        while child is not None:
+            nxt = child.get_next_sibling()
+            self.hbbtv_list.remove(child)
+            child = nxt
+        for app in self._apps:
+            self.hbbtv_list.append(HbbtvAppRow(app, on_activate=self.on_hbbtv_app_activate))
+
+        kind = "radio-hbbtv" if self.channel.is_radio else "tv-hbbtv"
+        self.hbbtv_expander_btn.set_tooltip_text(
+            f"{len(self._apps)} aplikacja(-e) HbbTV [{kind}]" if has_apps else "Aplikacje HbbTV"
+        )
+
+    def _on_hbbtv_expander_toggled(self, btn: Gtk.ToggleButton) -> None:
+        expanded = btn.get_active()
+        self.hbbtv_list.set_visible(expanded)
+        btn.set_icon_name("pan-up-symbolic" if expanded else "pan-down-symbolic")
+
+    def _on_hbbtv_row_activated(self, _listbox, row: "HbbtvAppRow") -> None:
+        row.activate_app()
 
     def update_channel(self, channel: Channel, library: TvhLibrary) -> None:
         """Odswieza istniejacy wiersz nowymi danymi kanalu (numer, nazwa,
@@ -104,6 +229,10 @@ class ChannelRow(Gtk.ListBoxRow):
 
         if is_favorite(channel.channel_id, channel.is_radio) != is_favorite(old_channel.channel_id, old_channel.is_radio):
             self._sync_fav_icon()
+
+    def apply_hbbtv_state(self, library: TvhLibrary) -> None:
+        state = library.get_hbbtv_state(self.channel.channel_id)
+        self.set_hbbtv_apps(state.apps if state else [])
 
     def _sync_fav_icon(self) -> None:
         active = is_favorite(self.channel.channel_id, self.channel.is_radio)
@@ -157,12 +286,14 @@ class ChannelListView(Gtk.Box):
     playlisty/kategorie kanalow.
     """
 
-    def __init__(self, library: TvhLibrary, radio: bool, on_play: Callable[[Channel], None]) -> None:
+    def __init__(self, library: TvhLibrary, radio: bool, on_play: Callable[[Channel], None],
+                 on_hbbtv_app_activate: Optional[Callable[[Channel, object], None]] = None) -> None:
         super().__init__(orientation=Gtk.Orientation.VERTICAL)
         self.set_hexpand(False)
         self.library = library
         self.radio = radio
         self.on_play = on_play
+        self._on_hbbtv_app_activate = on_hbbtv_app_activate
         self.active_tag_id: Optional[int] = None
         self._tag_buttons: Dict[Optional[int], Gtk.ToggleButton] = {}
         # Indeks channel_id -> ChannelRow, zeby reload() mogl diffowac
@@ -208,8 +339,13 @@ class ChannelListView(Gtk.Box):
         library.connect("channels-changed", lambda *_: self.reload())
         library.connect("epg-changed", lambda _lib, ch_id: self._refresh_row(ch_id))
         library.connect("tags-changed", lambda *_: self._rebuild_tag_chips())
+        library.connect("hbbtv-changed", lambda _lib, ch_id: self._refresh_hbbtv_row(ch_id))
         self._rebuild_tag_chips()
         self.reload()
+
+    def _on_channel_hbbtv_app_activate(self, channel: Channel, app) -> None:
+        if self._on_hbbtv_app_activate:
+            self._on_hbbtv_app_activate(channel, app)
 
     def reload(self) -> None:
         channels = self.library.radio_channels() if self.radio else self.library.tv_channels()
@@ -229,9 +365,17 @@ class ChannelListView(Gtk.Box):
         for ch in channels:
             row = self._rows.get(ch.channel_id)
             if row is None:
-                row = ChannelRow(ch, self.library, on_favorite_toggled=self._on_fav_changed)
+                row = ChannelRow(
+                    ch, self.library,
+                    on_favorite_toggled=self._on_fav_changed,
+                    on_hbbtv_app_activate=lambda app, c=ch: self._on_channel_hbbtv_app_activate(c, app),
+                )
                 self._rows[ch.channel_id] = row
                 self.listbox.append(row)
+                row.apply_hbbtv_state(self.library)
+                # Zapytanie JSON API w tle - nie blokuje UI, wynik przyjdzie
+                # przez sygnal "hbbtv-changed" jesli kanal ma HbbTV.
+                self.library.fetch_hbbtv_for_channel(ch)
             else:
                 row.update_channel(ch, self.library)
 
@@ -256,6 +400,11 @@ class ChannelListView(Gtk.Box):
         row = self._rows.get(channel_id)
         if row is not None:
             row.refresh_program(self.library)
+
+    def _refresh_hbbtv_row(self, channel_id: int) -> None:
+        row = self._rows.get(channel_id)
+        if row is not None:
+            row.apply_hbbtv_state(self.library)
 
     # ------------------------------------------------------------------ #
     # Filtrowanie: tekst wyszukiwania + wybrany tag (SD/HD/Radio/...)

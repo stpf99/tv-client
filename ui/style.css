@@ -121,6 +121,25 @@
   color: @accent_fg_color;
 }
 
+/* Znacznik "kanal ma wykryta aplikacje HbbTV" obok nazwy kanalu */
+.tvh-hbbtv-badge {
+  border-radius: 6px;
+  padding: 0px 6px;
+  background-color: alpha(@accent_bg_color, 0.75);
+  color: @accent_fg_color;
+  font-size: 0.75em;
+  font-weight: bold;
+}
+
+/* Sublista aplikacji HbbTV pod wierszem kanalu (tv-hbbtv / radio-hbbtv) */
+.tvh-hbbtv-sublist {
+  background-color: alpha(@window_fg_color, 0.03);
+}
+
+.tvh-hbbtv-app-row:hover {
+  background-color: alpha(@accent_bg_color, 0.10);
+}
+
 /* Kafelki "Ostatnio odtwarzane" - jak widget Kodi na ekranie glownym */
 .tvh-recent-tile {
   border-radius: 12px;

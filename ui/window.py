@@ -204,11 +204,22 @@ class MainWindow(Adw.ApplicationWindow):
     def _build_live_page(self, radio: bool) -> LiveView:
         live_view = LiveView(self.library, self.stream_ctrl, self)
         channel_list = ChannelListView(
-            self.library, radio, on_play=lambda ch: self._play_channel(ch, live_view)
+            self.library, radio,
+            on_play=lambda ch: self._play_channel(ch, live_view),
+            on_hbbtv_app_activate=self._on_hbbtv_app_activate,
         )
         live_view.set_channel_list(channel_list)
         live_view.channel_list = channel_list  # type: ignore[attr-defined]
         return live_view
+
+    def _on_hbbtv_app_activate(self, channel: Channel, app) -> None:
+        """Klikniecie pozycji w podliscie HbbTV kanalu - na razie otwiera
+        URL aplikacji w domyslnej przegladarce systemowej (fallback bez
+        renderowania w aplikacji - patrz dyskusja o WebKit/OIPF)."""
+        if not app.url:
+            return
+        logger.info("Otwieranie aplikacji HbbTV %s (%s) -> %s", app.display_name, channel.name, app.url)
+        Gio.AppInfo.launch_default_for_uri(app.url, None)
 
     def _build_mini_status_bar(self) -> Gtk.Widget:
         bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
