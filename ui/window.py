@@ -206,20 +206,22 @@ class MainWindow(Adw.ApplicationWindow):
         channel_list = ChannelListView(
             self.library, radio,
             on_play=lambda ch: self._play_channel(ch, live_view),
-            on_hbbtv_app_activate=self._on_hbbtv_app_activate,
+            on_hbbtv_app_activate=lambda channel, app: self._on_hbbtv_app_activate(channel, app, live_view),
+            on_close=live_view.hide_channel_list,
         )
         live_view.set_channel_list(channel_list)
         live_view.channel_list = channel_list  # type: ignore[attr-defined]
         return live_view
 
-    def _on_hbbtv_app_activate(self, channel: Channel, app) -> None:
-        """Klikniecie pozycji w podliscie HbbTV kanalu - na razie otwiera
-        URL aplikacji w domyslnej przegladarce systemowej (fallback bez
-        renderowania w aplikacji - patrz dyskusja o WebKit/OIPF)."""
+    def _on_hbbtv_app_activate(self, channel: Channel, app, live_view: LiveView) -> None:
+        """Klikniecie pozycji w podliscie HbbTV kanalu - renderuje aplikacje
+        w warstwie WebKitGTK nalozonej na wideo (patrz player/hbbtv_overlay.py
+        i LiveView.launch_hbbtv_app), zamiast otwierac ja w zewnetrznej
+        przegladarce systemowej."""
         if not app.url:
             return
-        logger.info("Otwieranie aplikacji HbbTV %s (%s) -> %s", app.display_name, channel.name, app.url)
-        Gio.AppInfo.launch_default_for_uri(app.url, None)
+        logger.info("Uruchamiam aplikacje HbbTV %s (%s) -> %s", app.display_name, channel.name, app.url)
+        live_view.launch_hbbtv_app(app)
 
     def _build_mini_status_bar(self) -> Gtk.Widget:
         bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)

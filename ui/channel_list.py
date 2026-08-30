@@ -287,13 +287,18 @@ class ChannelListView(Gtk.Box):
     """
 
     def __init__(self, library: TvhLibrary, radio: bool, on_play: Callable[[Channel], None],
-                 on_hbbtv_app_activate: Optional[Callable[[Channel, object], None]] = None) -> None:
+                 on_hbbtv_app_activate: Optional[Callable[[Channel, object], None]] = None,
+                 on_close: Optional[Callable[[], None]] = None) -> None:
         super().__init__(orientation=Gtk.Orientation.VERTICAL)
         self.set_hexpand(False)
         self.library = library
         self.radio = radio
         self.on_play = on_play
         self._on_hbbtv_app_activate = on_hbbtv_app_activate
+        # Patrz komentarze w _on_channel_hbbtv_app_activate / _on_row_activated
+        # ponizej - zabezpieczenie przed podwojna aktywacja (klik na
+        # HbbtvAppRow bulgoczacy do glownego listbox kanalow).
+        self._suppress_next_row_activation = False
         self.active_tag_id: Optional[int] = None
         self._tag_buttons: Dict[Optional[int], Gtk.ToggleButton] = {}
         # Indeks channel_id -> ChannelRow, zeby reload() mogl diffowac
@@ -301,6 +306,29 @@ class ChannelListView(Gtk.Box):
         # channels-changed, a _refresh_row() mogl znalezc wiersz w O(1)
         # zamiast liniowego przeszukiwania Gtk.ListBox.
         self._rows: Dict[int, ChannelRow] = {}
+
+        # Naglowek z przyciskiem X - reczne ukrywanie panelu bezposrednio z
+        # niego samego, niezaleznie od tego czy belka OSD (z drugim takim
+        # przyciskiem, list_btn w LiveView) jest akurat widoczna czy nie -
+        # belka znika po 5s bez ruchu myszy, ten przycisk zostaje zawsze
+        # dostepny dopoki panel jest otwarty.
+        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        header.set_margin_top(8)
+        header.set_margin_start(8)
+        header.set_margin_end(8)
+        title = Gtk.Label(label="Kanały radiowe" if radio else "Kanały")
+        title.add_css_class("heading")
+        title.set_halign(Gtk.Align.START)
+        title.set_hexpand(True)
+        header.append(title)
+        if on_close is not None:
+            close_btn = Gtk.Button()
+            close_btn.set_child(Gtk.Image.new_from_icon_name("window-close-symbolic"))
+            close_btn.add_css_class("flat")
+            close_btn.add_css_class("circular")
+            close_btn.set_tooltip_text("Ukryj listę kanałów")
+            close_btn.connect("clicked", lambda _btn: on_close())
+            header.append(close_btn)
 
         search = Gtk.SearchEntry(placeholder_text="Szukaj kanału…")
         search.set_margin_top(8)
@@ -331,6 +359,7 @@ class ChannelListView(Gtk.Box):
         self.listbox.connect("row-activated", self._on_row_activated)
         scroller.set_child(self.listbox)
 
+        self.append(header)
         self.append(search)
         self.append(tag_scroller)
         self.append(scroller)
@@ -344,6 +373,16 @@ class ChannelListView(Gtk.Box):
         self.reload()
 
     def _on_channel_hbbtv_app_activate(self, channel: Channel, app) -> None:
+        # UWAGA: klikniecie w HbbtvAppRow (wiersz zagniezdzonej self.hbbtv_list
+        # wewnatrz ChannelRow) bulgocze w gore i aktywuje TAKZE ChannelRow jako
+        # wiersz glownej self.listbox (oba to Gtk.ListBoxRow, GtkListBox
+        # aktywuje wiersz na klikniecie gdziekolwiek w jego obszarze - nie
+        # zatrzymuje sie na granicy zagniezdzonej listy potomnej). Bez tej
+        # flagi _on_row_activated ponizej odpalal on_play() zaraz PO
+        # launch_hbbtv_app(), co przez LiveView.play_channel() natychmiast
+        # zamykalo dopiero co otwarta aplikacje HbbTV (patrz log: "uruchamiam"
+        # i "zamykam" w tej samej milisekundzie).
+        self._suppress_next_row_activation = True
         if self._on_hbbtv_app_activate:
             self._on_hbbtv_app_activate(channel, app)
 
@@ -474,4 +513,11 @@ class ChannelListView(Gtk.Box):
         self.listbox.invalidate_filter()
 
     def _on_row_activated(self, _listbox, row: ChannelRow) -> None:
+        # Patrz komentarz w _on_channel_hbbtv_app_activate: klikniecie w
+        # HbbtvAppRow potrafi wywolac TAKZE ta aktywacje glownego wiersza
+        # (ta sama sekwencja zdarzen GTK). Pomijamy ja jednorazowo, zeby nie
+        # zamknac aplikacji HbbTV zaraz po jej uruchomieniu.
+        if self._suppress_next_row_activation:
+            self._suppress_next_row_activation = False
+            return
         self.on_play(row.channel)

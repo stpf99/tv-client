@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import time
 from typing import Optional
@@ -13,6 +14,10 @@ from gi.repository import Gtk, Adw, GLib, GObject, Pango  # noqa: E402
 from tvh.library import TvhLibrary
 from tvh.models import Channel, EpgEvent
 from player.stream_controller import StreamController, SUBTITLE_AUTO
+from player.hbbtv_overlay import (
+    HbbtvOverlay, KEYSET_RED, KEYSET_GREEN, KEYSET_YELLOW, KEYSET_BLUE,
+)
+from tvh.hbbtv import HbbtvApp
 from ui.icon_cache import make_icon_widget, update_icon_widget
 
 # OSD znika po 5 s bez ruchu myszy / kliknięcia
@@ -54,6 +59,7 @@ class LiveView(Gtk.Box):
         self._clock_source: Optional[int] = None
         self._progress_source: Optional[int] = None
         self._current_event: Optional[EpgEvent] = None
+        self._refreshing_progress = False
 
         self.overlay = Gtk.Overlay(vexpand=True, hexpand=True)
         self.overlay.add_css_class("tvh-video-area")
@@ -115,6 +121,18 @@ class LiveView(Gtk.Box):
         self.buffering_box.append(buffering_lbl)
         self.buffering_box.set_visible(False)
         self.overlay.add_overlay(self.buffering_box)
+
+        # Warstwa HbbTV (WebKitGTK) - nad wideo, pod OSD zbudowanym ponizej.
+        # Uruchamiana z listy kanalow (HbbtvAppRow.on_activate ->
+        # ChannelListView -> self.launch_hbbtv_app ponizej) po wykryciu
+        # aplikacji w AIT przez Tvheadend (patrz tvh/hbbtv.py).
+        self.hbbtv = HbbtvOverlay(
+            on_fullscreen_request=self._on_hbbtv_fullscreen,
+            on_set_channel_request=self._on_hbbtv_set_channel,
+            on_show_hide=self._on_hbbtv_show_hide,
+            on_keyset_changed=self._on_hbbtv_keyset_changed,
+        )
+        self.overlay.add_overlay(self.hbbtv.widget)
 
         self._build_osd()
 
@@ -271,6 +289,45 @@ class LiveView(Gtk.Box):
         self.audio_btn.set_tooltip_text("Ścieżka audio")
         self.sub_btn = self._osd_button("media-view-subtitles-symbolic", self._on_sub_menu)
         self.sub_btn.set_tooltip_text("Napisy")
+
+        # Sterowanie aplikacja HbbTV - widoczne tylko gdy aplikacja jest
+        # uruchomiona (patrz HbbtvOverlay.launch/close oraz
+        # _on_hbbtv_show_hide). hbbtv_toggle_btn przelacza miedzy pokazaniem
+        # i schowaniem warstwy WebView (bez jej zamykania - odpowiednik
+        # Application.show()/hide() woloanego z zewnatrz aplikacji, przydatne
+        # gdy uzytkownik chce chwilowo zobaczyc czysty obraz TV).
+        # hbbtv_close_btn konczy aplikacje (Application.destroyApplication()
+        # po stronie hosta - patrz HbbtvOverlay.close()).
+        self.hbbtv_toggle_btn = self._osd_button("view-app-grid-symbolic", self._on_hbbtv_toggle)
+        self.hbbtv_toggle_btn.set_tooltip_text("Pokaż/ukryj aplikację HbbTV")
+        self.hbbtv_close_btn = self._osd_button("window-close-symbolic", self._on_hbbtv_close)
+        self.hbbtv_close_btn.set_tooltip_text("Zamknij aplikację HbbTV")
+        self.hbbtv_toggle_btn.set_visible(False)
+        self.hbbtv_close_btn.set_visible(False)
+
+        # 4 kolorowe przyciski pilota (VK_RED/GREEN/YELLOW/BLUE) - widoczne
+        # tylko dla tych kolorow, ktore aplikacja aktualnie "posiada" w
+        # swoim keysecie (Application.privateData.keyset.setValue(...) po
+        # stronie JS -> HbbtvOverlay._on_script_message -> tu, patrz
+        # _on_hbbtv_keyset_changed nizej). RED jest widoczny od razu po
+        # starcie aplikacji (HbbtvOverlay.launch() domyslnie ustawia
+        # KEYSET_RED), reszta dopiero gdy portal jej zazada.
+        self.hbbtv_color_btns = {}
+        for vk, keyset_bit, css_class, label in (
+            (403, KEYSET_RED, "hbbtv-red", "Czerwony"),
+            (404, KEYSET_GREEN, "hbbtv-green", "Zielony"),
+            (405, KEYSET_YELLOW, "hbbtv-yellow", "Żółty"),
+            (406, KEYSET_BLUE, "hbbtv-blue", "Niebieski"),
+        ):
+            btn = Gtk.Button()
+            btn.add_css_class("circular")
+            btn.add_css_class("osd")
+            btn.add_css_class(css_class)
+            btn.set_tooltip_text(label)
+            btn.set_visible(False)
+            btn.connect("clicked", self._on_hbbtv_color_pressed, vk)
+            self.hbbtv_color_btns[keyset_bit] = btn
+
         self.prefs_btn = self._osd_button("preferences-system-symbolic", self._on_prefs)
         self.prefs_btn.set_tooltip_text("Preferencje odtwarzacza")
 
@@ -284,7 +341,12 @@ class LiveView(Gtk.Box):
         spacer = Gtk.Box(hexpand=True)
 
         for w in (self.play_btn, self.stop_btn, self.mute_btn, self.volume_scale,
-                  self.audio_btn, self.sub_btn):
+                  self.audio_btn, self.sub_btn,
+                  # Kolejnosc RED/GREEN/YELLOW/BLUE ustalona przez klucze
+                  # w slowniku (patrz petla wyzej) - zgodna z ukladem pilota.
+                  self.hbbtv_color_btns[KEYSET_RED], self.hbbtv_color_btns[KEYSET_GREEN],
+                  self.hbbtv_color_btns[KEYSET_YELLOW], self.hbbtv_color_btns[KEYSET_BLUE],
+                  self.hbbtv_toggle_btn, self.hbbtv_close_btn):
             controls.append(w)
         controls.append(spacer)
         for w in (self.prefs_btn, self.record_btn, self.minimize_btn, self.fullscreen_btn):
@@ -349,6 +411,21 @@ class LiveView(Gtk.Box):
             return
         shown = self.channel_list_revealer.get_reveal_child()
         self.channel_list_revealer.set_reveal_child(not shown)
+
+    def hide_channel_list(self) -> None:
+        """Chowa panel listy kanalow (playlisty) - wolane z przycisku X na
+        samym panelu (patrz ui/channel_list.py: on_close), z toggle na
+        belce OSD (patrz _on_toggle_channel_list) oraz automatycznie po
+        wejsciu w widok HbbTV (patrz launch_hbbtv_app nizej) - lista i
+        interaktywna apka HbbTV nie maja sensu widoczne jednoczesnie."""
+        if self.channel_list_revealer is None:
+            return
+        self.channel_list_revealer.set_reveal_child(False)
+
+    def show_channel_list(self) -> None:
+        if self.channel_list_revealer is None:
+            return
+        self.channel_list_revealer.set_reveal_child(True)
         self._show_osd_temporarily()
 
     def _on_decoder_chosen(self, _player, element_name: str, kind: str) -> None:
@@ -399,6 +476,13 @@ class LiveView(Gtk.Box):
     def play_channel(self, channel: Channel) -> None:
         self.decoder_lbl.set_visible(False)
         self.stream_info_lbl.set_visible(False)
+        # Zmiana kanalu na zywo konczy biezaca aplikacje HbbTV (tak jak na
+        # realnym STB - AIT poprzedniego kanalu przestaje obowiazywac).
+        # Jesli chcesz zeby aplikacja "przezyla" zmiane kanalu (np. wlasny
+        # EPG portalu), zamien to na self.hbbtv.notify_channel_changed(...).
+        if self.hbbtv.is_running:
+            self.hbbtv.close()
+            self._update_hbbtv_controls()
         self.stream_ctrl.play_channel(channel)
         self.channel_lbl.set_text(f"{channel.number or ''} {channel.name}".strip())
         update_icon_widget(self.osd_channel_icon, self.library.resolve_icon_url(channel.icon_url))
@@ -410,6 +494,97 @@ class LiveView(Gtk.Box):
         self.maybe_hide_channel_list()
         self._show_osd_temporarily()
         self._ensure_progress_timer()
+
+    # ------------------------------------------------------------------
+    # HbbTV
+    # ------------------------------------------------------------------
+    def launch_hbbtv_app(self, app: HbbtvApp) -> None:
+        """Wywolywane po kliknieciu pozycji HbbtvAppRow w liscie kanalow
+        (patrz ui/channel_list.py: on_hbbtv_app_activate)."""
+        self.hbbtv.launch(app)
+        self._update_hbbtv_controls()
+        self._show_osd_temporarily()
+        # Autoukrywanie playlisty w widoku HbbTV - interaktywna apka i
+        # lista kanalow nachodzace na siebie nie maja sensu, a apka i tak
+        # zajmuje cala nakladke wideo. Bezwarunkowe (nie pod flaga
+        # auto_hide_channel_list jak maybe_hide_channel_list() przy zmianie
+        # kanalu) - tu nie ma dobrego powodu, zeby playlista zostawala.
+        self.hide_channel_list()
+
+    def close_hbbtv_app(self) -> None:
+        self.hbbtv.close()
+        self._update_hbbtv_controls()
+
+    def _update_hbbtv_controls(self) -> None:
+        """Pokazuje/chowa przyciski HbbTV na belce OSD w zaleznosci od
+        tego, czy aplikacja jest aktualnie uruchomiona (HbbtvOverlay.is_running)
+        oraz aktualizuje ikone toggle wg widocznosci warstwy WebView."""
+        running = self.hbbtv.is_running
+        self.hbbtv_toggle_btn.set_visible(running)
+        self.hbbtv_close_btn.set_visible(running)
+        if running:
+            icon = "view-reveal-symbolic" if self.hbbtv.is_visible else "view-conceal-symbolic"
+            self.hbbtv_toggle_btn.set_child(Gtk.Image.new_from_icon_name(icon))
+        # Re-sync na wszelki wypadek (HbbtvOverlay i tak woła
+        # _on_hbbtv_keyset_changed przy kazdej zmianie maski - to tu jest
+        # dodatkowym zabezpieczeniem, gdyby ta metoda zostala wywolana z
+        # innego miejsca zanim/zamiast tamtego callbacku).
+        self._on_hbbtv_keyset_changed(self.hbbtv.keyset_mask)
+
+    def _on_hbbtv_keyset_changed(self, mask: int) -> None:
+        """HbbtvOverlay.on_keyset_changed - odpalane przy starcie/zamknieciu
+        aplikacji HbbTV oraz za kazdym razem, gdy portal zawola
+        Application.privateData.keyset.setValue(mask) (patrz tvh/hbbtv.py
+        opis polyfillu). Pokazuje na belce tylko te kolorowe przyciski,
+        ktore aplikacja aktualnie faktycznie obsluguje - klikniecie w
+        przycisk, ktorego apka nie zadeklarowala, i tak zostaloby
+        odrzucone przez HbbtvOverlay.dispatch_vk(), wiec lepiej go od razu
+        nie pokazywac."""
+        for keyset_bit, btn in self.hbbtv_color_btns.items():
+            btn.set_visible(bool(mask & keyset_bit))
+
+    def _on_hbbtv_color_pressed(self, _btn, vk: int) -> None:
+        """Klikniecie w kolorowy przycisk na belce OSD - ta sama sciezka
+        dispatchu co fizyczny klawisz pilota (F1-F4), patrz
+        HbbtvOverlay.dispatch_vk."""
+        self.hbbtv.dispatch_vk(vk)
+        self._show_osd_temporarily()
+
+    def _on_hbbtv_toggle(self, _btn) -> None:
+        """Przycisk na belce OSD - pokazuje/chowa warstwe WebView bez
+        zamykania aplikacji (odpowiednik Application.show()/hide(), tylko
+        wywolywany z UI hosta zamiast z JS aplikacji)."""
+        if not self.hbbtv.is_running:
+            return
+        if self.hbbtv.is_visible:
+            self.hbbtv.hide()
+        else:
+            self.hbbtv.show()
+        self._update_hbbtv_controls()
+
+    def _on_hbbtv_close(self, _btn) -> None:
+        self.close_hbbtv_app()
+
+    def _on_hbbtv_fullscreen(self, value: bool) -> None:
+        """broadcast.setFullScreen(...) z aplikacji HbbTV. WebView jest juz
+        overlayem na cala powierzchnie wideo, wiec na razie tylko logujemy -
+        rozszerz jesli chcesz wspierac tryb 'object' (male okno wideo +
+        ramka), analogicznie do video-plane.tsx z grok-workspace."""
+        logging.getLogger(__name__).info("HbbTV zada fullscreen=%s", value)
+
+    def _on_hbbtv_set_channel(self, channel: dict) -> None:
+        """broadcast.setChannel(...) z aplikacji HbbTV - np. portal chce
+        przelaczyc na inny kanal z wlasnego EPG. Podepnij pod
+        self.stream_ctrl / self.library gdy bedziesz mial mapowanie
+        identyfikatorow kanalu HbbTV -> Channel z tvh/models.py."""
+        logging.getLogger(__name__).info("HbbTV zada zmiany kanalu: %s", channel)
+
+    def _on_hbbtv_show_hide(self, visible: bool) -> None:
+        """Aplikacja HbbTV woła show()/hide() z wlasnego JS (Application.show/
+        hide) - synchronizujemy ikone przycisku toggle na belce OSD."""
+        self._update_hbbtv_controls()
+        if visible:
+            self.hide_channel_list()
 
     def maybe_hide_channel_list(self) -> None:
         """Chowa panel listy kanalow po wyborze - o ile wlaczone w
@@ -461,7 +636,13 @@ class LiveView(Gtk.Box):
 
         self.time_start_lbl.set_text(time.strftime("%H:%M", time.localtime(ev.start)))
         self.time_end_lbl.set_text(time.strftime("%H:%M", time.localtime(ev.stop)))
-        self._refresh_progress()
+        # _refresh_progress moze z powrotem wywolac _update_program_info gdy
+        # ev.stop <= now (koniec audycji, EPG jeszcze nie ma kolejnej pozycji
+        # zaladowanej) - zabezpieczenie przed nieskonczona rekursja/
+        # RecursionError ponizej w _refresh_progress (flaga
+        # self._refreshing_progress).
+        if not getattr(self, "_refreshing_progress", False):
+            self._refresh_progress()
 
     def _clear_program_info(self) -> None:
         self._current_event = None
@@ -569,11 +750,20 @@ class LiveView(Gtk.Box):
         else:
             self.time_remain_lbl.set_text(f"−{remain // 60}:{remain % 60:02d}")
 
-        # Koniec audycji → odśwież EPG
+        # Koniec audycji → odśwież EPG. self._refreshing_progress chroni
+        # przed nieskonczona rekursja _refresh_progress <-> _update_program_info:
+        # jesli po odswiezeniu library nadal zwraca to samo (przeterminowane)
+        # wydarzenie - bo brak kolejnych danych EPG na kanale - _update_program_info
+        # NIE wywola nas ponownie (patrz flaga tam), tylko czekamy na
+        # nastepny tick timera (self._progress_source).
         if now >= ev.stop:
             ch = self.stream_ctrl.current_channel
             if ch:
-                self._update_program_info(ch)
+                self._refreshing_progress = True
+                try:
+                    self._update_program_info(ch)
+                finally:
+                    self._refreshing_progress = False
 
     def _ensure_progress_timer(self) -> None:
         if self._progress_source is not None:
@@ -611,7 +801,21 @@ class LiveView(Gtk.Box):
             except Exception:
                 pass
 
+    # Mapowanie stanu GstPlayer ("state-changed") na OIPF
+    # video/broadcast.playState (0=unrealized 1=connecting 2=presenting
+    # 3=stopped) - zobacz oipf-polyfill.js / HbbtvOverlay.notify_broadcast_play_state.
+    _HBBTV_PLAY_STATE = {
+        "buffering": 1,
+        "playing": 2,
+        "paused": 2,
+        "stopped": 3,
+    }
+
     def _on_player_state(self, _player, state: str) -> None:
+        hbbtv_state = self._HBBTV_PLAY_STATE.get(state)
+        if hbbtv_state is not None:
+            self.hbbtv.notify_broadcast_play_state(hbbtv_state)
+
         if state == "buffering":
             self._buffering_spinner.start()
             self.buffering_box.set_visible(True)

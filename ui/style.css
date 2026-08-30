@@ -86,6 +86,34 @@
   background-color: alpha(white, 0.28);
 }
 
+/* Kolorowe przyciski pilota HbbTV (VK_RED/GREEN/YELLOW/BLUE) - patrz
+   ui/live_view.py: hbbtv_color_btns. Pelny kolor zamiast alpha(white,...)
+   jak reszta przyciskow OSD, zeby od razu bylo widac ktory to kolor. */
+.tvh-osd-bottom button.osd.hbbtv-red {
+  background-color: #e01b24;
+}
+.tvh-osd-bottom button.osd.hbbtv-red:hover {
+  background-color: #ff4d5a;
+}
+.tvh-osd-bottom button.osd.hbbtv-green {
+  background-color: #26a269;
+}
+.tvh-osd-bottom button.osd.hbbtv-green:hover {
+  background-color: #3ec78a;
+}
+.tvh-osd-bottom button.osd.hbbtv-yellow {
+  background-color: #e5a50a;
+}
+.tvh-osd-bottom button.osd.hbbtv-yellow:hover {
+  background-color: #ffc94d;
+}
+.tvh-osd-bottom button.osd.hbbtv-blue {
+  background-color: #1c71d8;
+}
+.tvh-osd-bottom button.osd.hbbtv-blue:hover {
+  background-color: #4a94f0;
+}
+
 /* Pasek postępu audycji (pozycja w programie EPG) */
 .tvh-osd-progress {
   min-height: 6px;
