@@ -1649,6 +1649,55 @@ class GstPlayer(GObject.GObject):
             self.pipeline.set_state(Gst.State.PAUSED)
             self.emit("state-changed", "paused")
 
+    @property
+    def is_http_mode(self) -> bool:
+        """True gdy odtwarzamy HTTP MPEG-TS (nagranie DVR / VOD), nie live HTSP."""
+        return bool(self._http_mode)
+
+    def get_position_ns(self) -> int:
+        """Biezaca pozycja odtwarzania w nanosekundach, lub -1 gdy niedostepna."""
+        if not self.pipeline:
+            return -1
+        try:
+            ok, pos = self.pipeline.query_position(Gst.Format.TIME)
+            return int(pos) if ok else -1
+        except Exception:
+            return -1
+
+    def get_duration_ns(self) -> int:
+        """Calkowity czas trwania w nanosekundach, lub -1 gdy niedostepny
+        (np. live stream bez duration)."""
+        if not self.pipeline:
+            return -1
+        try:
+            ok, dur = self.pipeline.query_duration(Gst.Format.TIME)
+            return int(dur) if ok and dur > 0 else -1
+        except Exception:
+            return -1
+
+    def seek_ns(self, position_ns: int) -> bool:
+        """Seek do pozycji (ns). Dziala tylko na seekowalnych zrodlach
+        (HTTP/DVR/VOD). Na zywym HTSP zwraca False bez efektu."""
+        if not self.pipeline or not self._http_mode:
+            return False
+        if position_ns < 0:
+            position_ns = 0
+        try:
+            flags = (
+                Gst.SeekFlags.FLUSH
+                | Gst.SeekFlags.KEY_UNIT
+                | Gst.SeekFlags.ACCURATE
+            )
+            ok = self.pipeline.seek_simple(Gst.Format.TIME, flags, int(position_ns))
+            if ok:
+                logger.info("Seek do %.1f s", position_ns / Gst.SECOND)
+            else:
+                logger.warning("Seek do %.1f s nieudany", position_ns / Gst.SECOND)
+            return bool(ok)
+        except Exception:
+            logger.exception("seek_ns")
+            return False
+
     def _emit_paintable_from(self, gtk_sink: Gst.Element) -> None:
         self.video_sink = gtk_sink
         try:

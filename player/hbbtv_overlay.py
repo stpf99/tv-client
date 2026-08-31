@@ -145,6 +145,7 @@ class HbbtvOverlay:
         on_set_channel_request: Optional[Callable[[dict], None]] = None,
         on_show_hide: Optional[Callable[[bool], None]] = None,
         on_keyset_changed: Optional[Callable[[int], None]] = None,
+        on_load_error: Optional[Callable[[str], None]] = None,
     ) -> None:
         self._app: Optional[HbbtvApp] = None
         self._keyset_mask = 0
@@ -158,6 +159,15 @@ class HbbtvOverlay:
         # -> 0) - UI (belka OSD) uzywa tego do pokazania/schowania 4
         # kolorowych przyciskow zamiast pollowac keyset_mask recznie.
         self.on_keyset_changed = on_keyset_changed
+        # Wywolywane gdy glowna ramka nie zaladuje sie (load-failed) albo
+        # proces WebKit padnie (web-process-terminated) W TRAKCIE gdy
+        # aplikacja jest uruchomiona (is_running). Krytyczne dla kanalow
+        # WIRTUALNYCH (TVP ABC 2/Kultura 2/Historia 2 i podobne - brak
+        # wlasnego strumienia DVB, appka HbbTV JEST cala trescia): bez tego
+        # blad renderowania portalu to po prostu pusty/czarny ekran bez
+        # zadnej informacji, bo nie ma pod spodem zadnego dzialajacego
+        # obrazu jako "widocznego" fallbacku. Patrz LiveView._on_hbbtv_load_error.
+        self.on_load_error = on_load_error
 
         # --- UserContentManager: wstrzykiwanie polyfillu + kanal wiadomosci
         self._ucm = WebKit.UserContentManager()
@@ -358,6 +368,10 @@ class HbbtvOverlay:
 
     def _on_load_failed(self, webview, load_event, failing_uri, error) -> bool:
         logger.error("HbbTV: load-failed uri=%s error=%s", failing_uri, error)
+        # is_running (nie is_visible) - blad moze przyjsc tuz po launch(),
+        # zanim _set_visible(True) w ogole zdazy przeleciec przez glowna petle.
+        if self.is_running and self.on_load_error:
+            self.on_load_error(f"load-failed: {error}")
         return False  # False = pozwol WebKit pokazac wlasna strone bledu
 
     def _on_web_process_terminated(self, webview, reason) -> None:
@@ -365,6 +379,8 @@ class HbbtvOverlay:
                      "sprawdz sandbox/GPU: WEBKIT_DISABLE_COMPOSITING_MODE=1, "
                      "WEBKIT_FORCE_SANDBOX=0, brak /usr/libexec/webkitgtk-6.0/WebKitWebProcess)",
                      reason)
+        if self.is_running and self.on_load_error:
+            self.on_load_error(f"web-process-terminated: {reason}")
 
     def _on_decide_policy(self, webview, decision, decision_type) -> bool:
         """HbbTV MIME: WebKit nie zna application/vnd.hbbtv.xhtml+xml.
