@@ -87,36 +87,58 @@
 }
 
 /* Kolorowe przyciski pilota HbbTV (VK_RED/GREEN/YELLOW/BLUE) - patrz
-   ui/live_view.py: hbbtv_color_btns. Pelny kolor zamiast alpha(white,...)
-   jak reszta przyciskow OSD, zeby od razu bylo widac ktory to kolor. */
-.tvh-osd-bottom button.osd.hbbtv-red {
+   ui/live_view.py: hbbtv_color_btns. Sa w .tvh-hbbtv-bar (nie w
+   .tvh-osd-bottom), wiec selektor musi trafic obie belki. Pelny kolor
+   zamiast alpha(white,...), zeby od razu bylo widac ktory to kolor. */
+.tvh-osd-bottom button.osd.hbbtv-red,
+.tvh-hbbtv-bar button.osd.hbbtv-red {
   background-color: #e01b24;
 }
-.tvh-osd-bottom button.osd.hbbtv-red:hover {
+.tvh-osd-bottom button.osd.hbbtv-red:hover,
+.tvh-hbbtv-bar button.osd.hbbtv-red:hover {
   background-color: #ff4d5a;
 }
-.tvh-osd-bottom button.osd.hbbtv-green {
+.tvh-osd-bottom button.osd.hbbtv-green,
+.tvh-hbbtv-bar button.osd.hbbtv-green {
   background-color: #26a269;
 }
-.tvh-osd-bottom button.osd.hbbtv-green:hover {
+.tvh-osd-bottom button.osd.hbbtv-green:hover,
+.tvh-hbbtv-bar button.osd.hbbtv-green:hover {
   background-color: #3ec78a;
 }
-.tvh-osd-bottom button.osd.hbbtv-yellow {
+.tvh-osd-bottom button.osd.hbbtv-yellow,
+.tvh-hbbtv-bar button.osd.hbbtv-yellow {
   background-color: #e5a50a;
 }
-.tvh-osd-bottom button.osd.hbbtv-yellow:hover {
+.tvh-osd-bottom button.osd.hbbtv-yellow:hover,
+.tvh-hbbtv-bar button.osd.hbbtv-yellow:hover {
   background-color: #ffc94d;
 }
-.tvh-osd-bottom button.osd.hbbtv-blue {
+.tvh-osd-bottom button.osd.hbbtv-blue,
+.tvh-hbbtv-bar button.osd.hbbtv-blue {
   background-color: #1c71d8;
 }
-.tvh-osd-bottom button.osd.hbbtv-blue:hover {
+.tvh-osd-bottom button.osd.hbbtv-blue:hover,
+.tvh-hbbtv-bar button.osd.hbbtv-blue:hover {
   background-color: #4a94f0;
 }
 
-/* Pasek postępu audycji (pozycja w programie EPG) */
+/* Staly pasek sterowania HbbTV (poza Overlayem OSD) */
+.tvh-hbbtv-bar {
+  background-color: alpha(black, 0.55);
+}
+.tvh-hbbtv-bar button.osd {
+  background-color: alpha(white, 0.14);
+  color: #ffffff;
+}
+.tvh-hbbtv-bar button.osd:hover {
+  background-color: alpha(white, 0.28);
+}
+
+/* Pasek postępu (EPG live / VOD seek) – Gtk.Scale */
 .tvh-osd-progress {
-  min-height: 6px;
+  min-height: 16px;
+  padding: 0;
 }
 
 .tvh-osd-progress trough {
@@ -125,10 +147,18 @@
   min-height: 6px;
 }
 
-.tvh-osd-progress progress {
+.tvh-osd-progress highlight {
   background-color: @accent_bg_color;
   border-radius: 3px;
   min-height: 6px;
+}
+
+.tvh-osd-progress slider {
+  min-width: 12px;
+  min-height: 12px;
+  margin: -4px 0;
+  background-color: white;
+  border-radius: 6px;
 }
 
 /* Wiersze kanalow */

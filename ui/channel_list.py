@@ -391,6 +391,27 @@ class ChannelListView(Gtk.Box):
         new_ids = [ch.channel_id for ch in channels]
         new_id_set = set(new_ids)
 
+        # Szybka sciezka: pierwsze zbudowanie TEJ listy (self._rows jeszcze
+        # puste). Dzieki TvhLibrary._mark_channels_settled() ten reload()
+        # jest teraz wolany dopiero gdy `channels` to juz KOMPLETNY, docelowo
+        # posortowany zestaw (a nie narastajaco co ~400ms w trakcie
+        # synchronizacji) - wiec budujemy wiersze od razu w finalnej
+        # kolejnosci, jeden append() na kanal, bez pozniejszego
+        # przestawiania (por. jednorazowy zbiorczy TriggerChannelUpdate() w
+        # pvr.hts zamiast wypychania kanalu po kanale).
+        if not self._rows and channels:
+            for ch in channels:
+                row = ChannelRow(
+                    ch, self.library,
+                    on_favorite_toggled=self._on_fav_changed,
+                    on_hbbtv_app_activate=lambda app, c=ch: self._on_channel_hbbtv_app_activate(c, app),
+                )
+                self._rows[ch.channel_id] = row
+                self.listbox.append(row)
+                row.apply_hbbtv_state(self.library)
+                self.library.fetch_hbbtv_for_channel(ch)
+            return
+
         # Usun wiersze kanalow, ktorych juz nie ma (usuniete na serwerze
         # albo przelaczyly sie miedzy TV/Radio).
         for old_id in list(self._rows.keys()):

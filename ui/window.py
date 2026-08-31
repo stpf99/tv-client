@@ -256,9 +256,25 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _on_key_pressed(self, _ctrl, keyval, _keycode, _state) -> bool:
         from gi.repository import Gdk
-        if keyval == Gdk.KEY_Escape and self.is_fullscreen():
-            self.unfullscreen()
-            return True
+
+        # Escape: najpierw wyjscie z trybu kino, potem z fullscreen
+        if keyval == Gdk.KEY_Escape:
+            live = self._active_live_view()
+            if live is not None and live.cinema_mode:
+                live.set_cinema_mode(False)
+                return True
+            if self.is_fullscreen():
+                self.unfullscreen()
+                return True
+            return False
+
+        # F / f – prawdziwy tryb ogladania bez GUI (OSD, lista, pasek HbbTV)
+        if keyval in (Gdk.KEY_f, Gdk.KEY_F):
+            live = self._active_live_view()
+            if live is not None:
+                live.toggle_cinema_mode()
+                return True
+
         if keyval == Gdk.KEY_F11:
             if self.is_fullscreen():
                 self.unfullscreen()

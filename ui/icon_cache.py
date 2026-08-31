@@ -27,6 +27,13 @@ logger = logging.getLogger("ui.icon_cache")
 _CACHE_DIR = Path(GLib.get_user_cache_dir()) / "tvh-gnome-client" / "icons"
 _FETCH_TIMEOUT_S = 6.0
 _MAX_BYTES = 4 * 1024 * 1024  # 4 MB - twardy limit, ikony stacji sa male
+# Limit rownoleglych pobran HTTP. Od kiedy ChannelListView.reload() buduje
+# cala liste kanalow jednym wsadem (patrz ui/channel_list.py), wszystkie
+# jeszcze niescache'owane ikony sa zadane niemal jednoczesnie - bez tego
+# limitu pierwsze uruchomienie na nowym serwerze otwieraloby az tyle
+# rownoleglych polaczen do jego webservera, ile jest unikalnych ikon.
+_MAX_CONCURRENT_FETCHES = 6
+_fetch_semaphore = threading.Semaphore(_MAX_CONCURRENT_FETCHES)
 
 
 def _cache_path(url: str) -> Path:
@@ -117,9 +124,10 @@ class IconCache(GObject.GObject):
             if cpath.exists():
                 data = cpath.read_bytes()
             else:
-                req = Request(url, headers={"User-Agent": "tvh-gnome-client"})
-                with urlopen(req, timeout=_FETCH_TIMEOUT_S) as resp:
-                    data = resp.read(_MAX_BYTES + 1)
+                with _fetch_semaphore:
+                    req = Request(url, headers={"User-Agent": "tvh-gnome-client"})
+                    with urlopen(req, timeout=_FETCH_TIMEOUT_S) as resp:
+                        data = resp.read(_MAX_BYTES + 1)
                 if data and len(data) <= _MAX_BYTES:
                     try:
                         _CACHE_DIR.mkdir(parents=True, exist_ok=True)

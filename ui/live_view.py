@@ -60,12 +60,25 @@ class LiveView(Gtk.Box):
         self._progress_source: Optional[int] = None
         self._current_event: Optional[EpgEvent] = None
         self._refreshing_progress = False
+        # Tryb "kino" / bez GUI: chowa OSD, liste kanalow i pasek HbbTV;
+        # wideo wypelnia caly obszar. Przelaczane klawiszem F (patrz
+        # window._on_key_pressed -> toggle_cinema_mode).
+        self._cinema_mode = False
+        self._video_area_size: tuple[int, int] = (0, 0)
+        self._seeking = False  # True gdy user przeciaga pasek VOD
 
         self.overlay = Gtk.Overlay(vexpand=True, hexpand=True)
         self.overlay.add_css_class("tvh-video-area")
 
         self.picture = Gtk.Picture()
+        # CONTAIN zachowuje proporcje (letterbox). Przy zmianie rozmiaru okna
+        # GdkPaintable z gtk4paintablesink bywa "przyklejony" do starego
+        # rozmiaru – patrz _on_video_area_size_changed (force invalidate).
         self.picture.set_content_fit(Gtk.ContentFit.CONTAIN)
+        self.picture.set_hexpand(True)
+        self.picture.set_vexpand(True)
+        self.picture.set_halign(Gtk.Align.FILL)
+        self.picture.set_valign(Gtk.Align.FILL)
 
         # Gtk.GraphicsOffload (GTK >=4.14): compositor Wayland skanuje klatkę
         # wideo bezpośrednio z DMABuf (gtk4paintablesink → GdkDmabufTexture),
@@ -131,8 +144,41 @@ class LiveView(Gtk.Box):
             on_set_channel_request=self._on_hbbtv_set_channel,
             on_show_hide=self._on_hbbtv_show_hide,
             on_keyset_changed=self._on_hbbtv_keyset_changed,
+            on_load_error=self._on_hbbtv_load_error,
         )
         self.overlay.add_overlay(self.hbbtv.widget)
+        self._hbbtv_last_app: Optional[HbbtvApp] = None
+
+        # Widoczny fallback, gdy glowna ramka portalu nie zaladuje sie albo
+        # proces WebKit padnie w trakcie dzialania aplikacji (patrz
+        # HbbtvOverlay.on_load_error / _on_hbbtv_load_error nizej). Bez tego
+        # blad renderowania to po prostu pusty/czarny ekran - krytyczne dla
+        # kanalow WIRTUALNYCH (np. TVP ABC 2/Kultura 2/Historia 2 - brak
+        # wlasnego strumienia DVB, appka HbbTV JEST cala trescia, wiec tu
+        # nie ma zadnego innego obrazu, ktory zostalby widoczny "pod spodem").
+        self.hbbtv_error_page = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL, spacing=10,
+            halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER,
+        )
+        self.hbbtv_error_page.add_css_class("tvh-hbbtv-error")
+        err_icon = Gtk.Image.new_from_icon_name("dialog-warning-symbolic")
+        err_icon.set_pixel_size(32)
+        self._hbbtv_error_lbl = Gtk.Label(label="Nie udało się wczytać aplikacji HbbTV")
+        self._hbbtv_error_lbl.add_css_class("title-4")
+        self._hbbtv_error_detail_lbl = Gtk.Label(label="")
+        self._hbbtv_error_detail_lbl.add_css_class("caption")
+        self._hbbtv_error_detail_lbl.add_css_class("dim-label")
+        self._hbbtv_error_detail_lbl.set_wrap(True)
+        self._hbbtv_error_detail_lbl.set_max_width_chars(60)
+        retry_btn = Gtk.Button(label="Spróbuj ponownie")
+        retry_btn.add_css_class("pill")
+        retry_btn.connect("clicked", self._on_hbbtv_retry)
+        self.hbbtv_error_page.append(err_icon)
+        self.hbbtv_error_page.append(self._hbbtv_error_lbl)
+        self.hbbtv_error_page.append(self._hbbtv_error_detail_lbl)
+        self.hbbtv_error_page.append(retry_btn)
+        self.hbbtv_error_page.set_visible(False)
+        self.overlay.add_overlay(self.hbbtv_error_page)
 
         self._build_osd()
 
@@ -145,8 +191,16 @@ class LiveView(Gtk.Box):
         self.overlay.add_controller(click)
 
         self.append(self.overlay)
+        # POZA self.overlay - wlasny wiersz layoutu ponizej wideo, nie
+        # kolejna nakladka Gtk.Overlay. Patrz _build_hbbtv_bar/_hbbtv_owns_screen.
+        self.append(self.hbbtv_bar)
         self.set_hexpand(True)
         self.set_vexpand(True)
+
+        # Przy zmianie rozmiaru okna (zmniejsz/powiększ) GdkPaintable z
+        # gtk4paintablesink potrafi zostac przy starym intrinsic size –
+        # tick sprawdza wymiary i wymusza redraw gdy sie zmienily.
+        self.overlay.add_tick_callback(self._on_video_tick)
 
         self.channel_list_revealer: Optional[Gtk.Revealer] = None
 
@@ -259,12 +313,21 @@ class LiveView(Gtk.Box):
         self.time_remain_lbl.add_css_class("caption")
         self.time_remain_lbl.add_css_class("dim-label")
 
-        self.progress = Gtk.ProgressBar()
+        # Pasek postępu: dla live (EPG) tylko wizualny, dla VOD/DVR
+        # (HTTP playbin) seekowalny – przeciągnięcie wywołuje player.seek_ns.
+        self.progress = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0.0, 1.0, 0.001)
         self.progress.set_hexpand(True)
         self.progress.set_valign(Gtk.Align.CENTER)
-        self.progress.set_fraction(0.0)
+        self.progress.set_draw_value(False)
+        self.progress.set_value(0.0)
         self.progress.add_css_class("tvh-osd-progress")
-        self.progress.set_show_text(False)
+        self.progress.set_sensitive(False)  # live domyslnie; VOD wlacza w _refresh
+        self.progress.connect("change-value", self._on_progress_seek)
+        # GestureClick: podczas przeciagania nie nadpisuj wartosci z ticka
+        _prog_click = Gtk.GestureClick()
+        _prog_click.connect("pressed", lambda *_: setattr(self, "_seeking", True))
+        _prog_click.connect("released", self._on_progress_gesture_release)
+        self.progress.add_controller(_prog_click)
 
         progress_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         progress_row.append(self.time_start_lbl)
@@ -290,20 +353,85 @@ class LiveView(Gtk.Box):
         self.sub_btn = self._osd_button("media-view-subtitles-symbolic", self._on_sub_menu)
         self.sub_btn.set_tooltip_text("Napisy")
 
-        # Sterowanie aplikacja HbbTV - widoczne tylko gdy aplikacja jest
-        # uruchomiona (patrz HbbtvOverlay.launch/close oraz
-        # _on_hbbtv_show_hide). hbbtv_toggle_btn przelacza miedzy pokazaniem
-        # i schowaniem warstwy WebView (bez jej zamykania - odpowiednik
-        # Application.show()/hide() woloanego z zewnatrz aplikacji, przydatne
-        # gdy uzytkownik chce chwilowo zobaczyc czysty obraz TV).
+        self.prefs_btn = self._osd_button("preferences-system-symbolic", self._on_prefs)
+        self.prefs_btn.set_tooltip_text("Preferencje odtwarzacza")
+
+        self.record_btn = self._osd_button("media-record-symbolic", self._on_record)
+        self.fullscreen_btn = self._osd_button(
+            "view-fullscreen-symbolic", self._on_fullscreen_toggle
+        )
+        self.minimize_btn = self._osd_button("go-down-symbolic", self._on_minimize_to_bg)
+        self.minimize_btn.set_tooltip_text("Zminimalizuj do tła (odtwarzanie w tle + powiadomienia)")
+
+        spacer = Gtk.Box(hexpand=True)
+
+        for w in (self.play_btn, self.stop_btn, self.mute_btn, self.volume_scale,
+                  self.audio_btn, self.sub_btn):
+            controls.append(w)
+        controls.append(spacer)
+        for w in (self.prefs_btn, self.record_btn, self.minimize_btn, self.fullscreen_btn):
+            controls.append(w)
+
+        self.bottom_osd.append(prog_info)
+        self.bottom_osd.append(progress_row)
+        self.bottom_osd.append(controls)
+
+        # Overlay – nie zajmuje miejsca w layoucie wideo
+        self.overlay.add_overlay(self.top_osd)
+        self.overlay.add_overlay(self.bottom_osd)
+
+        # Na starcie ukryte (brak odtwarzania)
+        self.top_osd.set_opacity(0)
+        self.bottom_osd.set_opacity(0)
+        self.top_osd.set_sensitive(False)
+        self.bottom_osd.set_sensitive(False)
+
+        self._build_hbbtv_bar()
+
+    def _build_hbbtv_bar(self) -> None:
+        """Stale widoczny (NIE znikajacy po 5 s) pasek sterowania HbbTV.
+
+        W odroznieniu od top_osd/bottom_osd, NIE jest nakladka Gtk.Overlay
+        nad warstwa WebView (self.hbbtv.widget) - to osobny wiersz w
+        pionowym Gtk.Box samego LiveView, dolaczany PONIZEJ self.overlay
+        (patrz koniec __init__: self.append(self.overlay) zaraz potem
+        self.append(self.hbbtv_bar)). Fizycznie zajmuje wlasna przestrzen
+        w layoucie, a nie kolejna warstwe nakladki - dzieki temu w ZADNYM
+        stanie (nawet sensitive=True) nie moze przechwycic kliknieca czy
+        dotyku przeznaczonego dla nawigacji w aplikacji HbbTV, w
+        odroznieniu od top_osd/bottom_osd (patrz uzasadnienie w
+        _hbbtv_owns_screen/_show_osd_temporarily nizej).
+
+        stop/mute sa tu DUPLIKATEM (osobne obiekty Gtk.Button, te same
+        handlery co self.stop_btn/self.mute_btn w zwyklym OSD) - potrzebne
+        w obu kontekstach. Kolorowe przyciski/toggle/close sa PRZENIESIONE
+        (jedna instancja) z dawnego `controls` w bottom_osd - mialy sens
+        wylacznie w trybie HbbTV, wiec nie ma czego duplikowac."""
+        self.hbbtv_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.hbbtv_bar.add_css_class("tvh-hbbtv-bar")
+        self.hbbtv_bar.set_margin_top(6)
+        self.hbbtv_bar.set_margin_bottom(6)
+        self.hbbtv_bar.set_margin_start(16)
+        self.hbbtv_bar.set_margin_end(16)
+        self.hbbtv_bar.set_visible(False)
+
+        self.hbbtv_stop_btn = self._osd_button("media-playback-stop-symbolic", self._on_stop)
+        self.hbbtv_stop_btn.set_tooltip_text("Zatrzymaj")
+        self.hbbtv_mute_btn = self._osd_button("audio-volume-high-symbolic", self._on_mute)
+        self.hbbtv_mute_btn.set_tooltip_text("Wycisz")
+
+        # Sterowanie aplikacja HbbTV. hbbtv_toggle_btn przelacza miedzy
+        # pokazaniem i schowaniem warstwy WebView (bez jej zamykania -
+        # odpowiednik Application.show()/hide() wolanego z zewnatrz
+        # aplikacji, przydatne gdy uzytkownik chce chwilowo zobaczyc czysty
+        # obraz TV - patrz _hbbtv_owns_screen: gdy webview jest schowany,
+        # zwykly znikajacy OSD wraca do normalnego dzialania).
         # hbbtv_close_btn konczy aplikacje (Application.destroyApplication()
         # po stronie hosta - patrz HbbtvOverlay.close()).
         self.hbbtv_toggle_btn = self._osd_button("view-app-grid-symbolic", self._on_hbbtv_toggle)
         self.hbbtv_toggle_btn.set_tooltip_text("Pokaż/ukryj aplikację HbbTV")
         self.hbbtv_close_btn = self._osd_button("window-close-symbolic", self._on_hbbtv_close)
         self.hbbtv_close_btn.set_tooltip_text("Zamknij aplikację HbbTV")
-        self.hbbtv_toggle_btn.set_visible(False)
-        self.hbbtv_close_btn.set_visible(False)
 
         # 4 kolorowe przyciski pilota (VK_RED/GREEN/YELLOW/BLUE) - widoczne
         # tylko dla tych kolorow, ktore aplikacja aktualnie "posiada" w
@@ -328,43 +456,16 @@ class LiveView(Gtk.Box):
             btn.connect("clicked", self._on_hbbtv_color_pressed, vk)
             self.hbbtv_color_btns[keyset_bit] = btn
 
-        self.prefs_btn = self._osd_button("preferences-system-symbolic", self._on_prefs)
-        self.prefs_btn.set_tooltip_text("Preferencje odtwarzacza")
-
-        self.record_btn = self._osd_button("media-record-symbolic", self._on_record)
-        self.fullscreen_btn = self._osd_button(
-            "view-fullscreen-symbolic", self._on_fullscreen_toggle
-        )
-        self.minimize_btn = self._osd_button("go-down-symbolic", self._on_minimize_to_bg)
-        self.minimize_btn.set_tooltip_text("Zminimalizuj do tła (odtwarzanie w tle + powiadomienia)")
-
-        spacer = Gtk.Box(hexpand=True)
-
-        for w in (self.play_btn, self.stop_btn, self.mute_btn, self.volume_scale,
-                  self.audio_btn, self.sub_btn,
+        hbbtv_spacer = Gtk.Box(hexpand=True)
+        for w in (self.hbbtv_stop_btn, self.hbbtv_mute_btn,
                   # Kolejnosc RED/GREEN/YELLOW/BLUE ustalona przez klucze
                   # w slowniku (patrz petla wyzej) - zgodna z ukladem pilota.
                   self.hbbtv_color_btns[KEYSET_RED], self.hbbtv_color_btns[KEYSET_GREEN],
-                  self.hbbtv_color_btns[KEYSET_YELLOW], self.hbbtv_color_btns[KEYSET_BLUE],
-                  self.hbbtv_toggle_btn, self.hbbtv_close_btn):
-            controls.append(w)
-        controls.append(spacer)
-        for w in (self.prefs_btn, self.record_btn, self.minimize_btn, self.fullscreen_btn):
-            controls.append(w)
-
-        self.bottom_osd.append(prog_info)
-        self.bottom_osd.append(progress_row)
-        self.bottom_osd.append(controls)
-
-        # Overlay – nie zajmuje miejsca w layoucie wideo
-        self.overlay.add_overlay(self.top_osd)
-        self.overlay.add_overlay(self.bottom_osd)
-
-        # Na starcie ukryte (brak odtwarzania)
-        self.top_osd.set_opacity(0)
-        self.bottom_osd.set_opacity(0)
-        self.top_osd.set_sensitive(False)
-        self.bottom_osd.set_sensitive(False)
+                  self.hbbtv_color_btns[KEYSET_YELLOW], self.hbbtv_color_btns[KEYSET_BLUE]):
+            self.hbbtv_bar.append(w)
+        self.hbbtv_bar.append(hbbtv_spacer)
+        for w in (self.hbbtv_toggle_btn, self.hbbtv_close_btn):
+            self.hbbtv_bar.append(w)
 
         self._start_clock()
 
@@ -501,9 +602,13 @@ class LiveView(Gtk.Box):
     def launch_hbbtv_app(self, app: HbbtvApp) -> None:
         """Wywolywane po kliknieciu pozycji HbbtvAppRow w liscie kanalow
         (patrz ui/channel_list.py: on_hbbtv_app_activate)."""
+        self._hbbtv_last_app = app
+        self.hbbtv_error_page.set_visible(False)
+        # Schowaj OSD zanim WebView wstanje - unikamy klatki z belkami
+        # nad portalem (motion/timeout mogl je trzymac opacity=1).
+        self._force_hide_osd()
         self.hbbtv.launch(app)
         self._update_hbbtv_controls()
-        self._show_osd_temporarily()
         # Autoukrywanie playlisty w widoku HbbTV - interaktywna apka i
         # lista kanalow nachodzace na siebie nie maja sensu, a apka i tak
         # zajmuje cala nakladke wideo. Bezwarunkowe (nie pod flaga
@@ -513,13 +618,50 @@ class LiveView(Gtk.Box):
 
     def close_hbbtv_app(self) -> None:
         self.hbbtv.close()
+        self.hbbtv_error_page.set_visible(False)
         self._update_hbbtv_controls()
+        # Przywroc widgety OSD (byly set_visible(False) w trybie HbbTV)
+        self.top_osd.set_visible(True)
+        self.bottom_osd.set_visible(True)
+        try:
+            self.top_osd.set_can_target(True)
+            self.bottom_osd.set_can_target(True)
+        except Exception:
+            pass
+        # Schowane opacity=0, pokaza sie przy ruchu myszy / zmianie kanalu
+        self.top_osd.set_opacity(0)
+        self.bottom_osd.set_opacity(0)
+        self.top_osd.set_sensitive(False)
+        self.bottom_osd.set_sensitive(False)
+
+    def _on_hbbtv_load_error(self, reason: str) -> None:
+        """HbbtvOverlay.on_load_error - glowna ramka portalu nie zaladowala
+        sie albo proces WebKit padl W TRAKCIE dzialania aplikacji. Bez tego
+        osoba widzi po prostu pusty/czarny ekran bez zadnej wskazowki - patrz
+        uzasadnienie przy HbbtvOverlay.__init__: on_load_error. Woluje sie z
+        watku roboczego WebKit przez sygnaly GTK, wiec GLib.idle_add nie jest
+        tu potrzebne (GTK i tak serializuje callbacki sygnalow w petli
+        glownej), ale zostawiamy defensywnie na wypadek przyszlych zmian."""
+        GLib.idle_add(self._show_hbbtv_error, reason)
+
+    def _show_hbbtv_error(self, reason: str) -> bool:
+        self._hbbtv_error_detail_lbl.set_text(reason)
+        self.hbbtv_error_page.set_visible(True)
+        return False
+
+    def _on_hbbtv_retry(self, _btn) -> None:
+        self.hbbtv_error_page.set_visible(False)
+        if self._hbbtv_last_app is not None:
+            self.hbbtv.launch(self._hbbtv_last_app)
+            self._update_hbbtv_controls()
 
     def _update_hbbtv_controls(self) -> None:
-        """Pokazuje/chowa przyciski HbbTV na belce OSD w zaleznosci od
-        tego, czy aplikacja jest aktualnie uruchomiona (HbbtvOverlay.is_running)
-        oraz aktualizuje ikone toggle wg widocznosci warstwy WebView."""
+        """Pokazuje/chowa pasek sterowania HbbTV (self.hbbtv_bar) w
+        zaleznosci od tego, czy aplikacja jest aktualnie uruchomiona
+        (HbbtvOverlay.is_running) oraz aktualizuje ikone toggle wg
+        widocznosci warstwy WebView."""
         running = self.hbbtv.is_running
+        self.hbbtv_bar.set_visible(running)
         self.hbbtv_toggle_btn.set_visible(running)
         self.hbbtv_close_btn.set_visible(running)
         if running:
@@ -530,6 +672,21 @@ class LiveView(Gtk.Box):
         # dodatkowym zabezpieczeniem, gdyby ta metoda zostala wywolana z
         # innego miejsca zanim/zamiast tamtego callbacku).
         self._on_hbbtv_keyset_changed(self.hbbtv.keyset_mask)
+        # Widoczna warstwa WebView wchodzi/wychodzi z "wlasnosci ekranu" -
+        # jesli w tej samej chwili trwa jeszcze odliczanie znikniecia
+        # zwyklego OSD sprzed przelaczenia, wymus natychmiastowe
+        # zsynchronizowanie zamiast czekac do konca timeoutu.
+        if self._hbbtv_owns_screen():
+            self._force_hide_osd()
+        elif self.hbbtv.is_running and not self.hbbtv.is_visible:
+            # WebView schowany toggle'em - przywroc mozliwosc OSD nad wideo
+            self.top_osd.set_visible(True)
+            self.bottom_osd.set_visible(True)
+            try:
+                self.top_osd.set_can_target(True)
+                self.bottom_osd.set_can_target(True)
+            except Exception:
+                pass
 
     def _on_hbbtv_keyset_changed(self, mask: int) -> None:
         """HbbtvOverlay.on_keyset_changed - odpalane przy starcie/zamknieciu
@@ -544,11 +701,10 @@ class LiveView(Gtk.Box):
             btn.set_visible(bool(mask & keyset_bit))
 
     def _on_hbbtv_color_pressed(self, _btn, vk: int) -> None:
-        """Klikniecie w kolorowy przycisk na belce OSD - ta sama sciezka
-        dispatchu co fizyczny klawisz pilota (F1-F4), patrz
-        HbbtvOverlay.dispatch_vk."""
+        """Klikniecie w kolorowy przycisk na stalym pasku HbbTV (patrz
+        _build_hbbtv_bar) - ta sama sciezka dispatchu co fizyczny klawisz
+        pilota (F1-F4), patrz HbbtvOverlay.dispatch_vk."""
         self.hbbtv.dispatch_vk(vk)
-        self._show_osd_temporarily()
 
     def _on_hbbtv_toggle(self, _btn) -> None:
         """Przycisk na belce OSD - pokazuje/chowa warstwe WebView bez
@@ -614,7 +770,7 @@ class LiveView(Gtk.Box):
             self.time_start_lbl.set_text("--:--")
             self.time_end_lbl.set_text("--:--")
             self.time_remain_lbl.set_text("")
-            self.progress.set_fraction(0.0)
+            self.progress.set_value(0.0)
             self._stop_desc_scroll()
             return
 
@@ -653,7 +809,7 @@ class LiveView(Gtk.Box):
         self.time_start_lbl.set_text("--:--")
         self.time_end_lbl.set_text("--:--")
         self.time_remain_lbl.set_text("")
-        self.progress.set_fraction(0.0)
+        self.progress.set_value(0.0)
 
     # ------------------------------------------------------------------ #
     # Preferencje OSD: rozmiar czcionki gornego paska, rozmiar czcionki
@@ -730,32 +886,37 @@ class LiveView(Gtk.Box):
         adj.set_value(value)
         return True
 
+    def _fmt_hms(self, seconds: float) -> str:
+        s = max(0, int(seconds))
+        if s >= 3600:
+            return f"{s // 3600}:{(s % 3600) // 60:02d}:{s % 60:02d}"
+        return f"{s // 60}:{s % 60:02d}"
+
     def _refresh_progress(self) -> None:
+        """Aktualizuje pasek: VOD/DVR z pozycji playbin, live z EPG."""
+        player = self.stream_ctrl.player
+        if getattr(player, "is_http_mode", False):
+            self._refresh_vod_progress()
+            return
+
+        # Live: pasek EPG (nie seekowalny)
+        self.progress.set_sensitive(False)
         ev = self._current_event
         if not ev or ev.stop <= ev.start:
-            self.progress.set_fraction(0.0)
+            if not self._seeking:
+                self.progress.set_value(0.0)
             self.time_remain_lbl.set_text("")
             return
         now = time.time()
         duration = float(ev.stop - ev.start)
         elapsed = max(0.0, min(duration, now - ev.start))
         frac = elapsed / duration
-        self.progress.set_fraction(frac)
+        if not self._seeking:
+            self.progress.set_value(frac)
 
         remain = max(0, int(ev.stop - now))
-        if remain >= 3600:
-            self.time_remain_lbl.set_text(
-                f"−{remain // 3600}:{(remain % 3600) // 60:02d}:{remain % 60:02d}"
-            )
-        else:
-            self.time_remain_lbl.set_text(f"−{remain // 60}:{remain % 60:02d}")
+        self.time_remain_lbl.set_text(f"−{self._fmt_hms(remain)}")
 
-        # Koniec audycji → odśwież EPG. self._refreshing_progress chroni
-        # przed nieskonczona rekursja _refresh_progress <-> _update_program_info:
-        # jesli po odswiezeniu library nadal zwraca to samo (przeterminowane)
-        # wydarzenie - bo brak kolejnych danych EPG na kanale - _update_program_info
-        # NIE wywola nas ponownie (patrz flaga tam), tylko czekamy na
-        # nastepny tick timera (self._progress_source).
         if now >= ev.stop:
             ch = self.stream_ctrl.current_channel
             if ch:
@@ -764,6 +925,56 @@ class LiveView(Gtk.Box):
                     self._update_program_info(ch)
                 finally:
                     self._refreshing_progress = False
+
+    def _refresh_vod_progress(self) -> None:
+        """Pasek pozycji dla nagrania DVR / HTTP VOD (seekowalny)."""
+        player = self.stream_ctrl.player
+        gi.require_version("Gst", "1.0")
+        from gi.repository import Gst
+
+        dur_ns = player.get_duration_ns()
+        pos_ns = player.get_position_ns()
+        seekable = dur_ns > 0
+        self.progress.set_sensitive(seekable)
+
+        if not seekable:
+            if not self._seeking:
+                self.progress.set_value(0.0)
+            self.time_start_lbl.set_text("--:--")
+            self.time_end_lbl.set_text("--:--")
+            self.time_remain_lbl.set_text("")
+            return
+
+        dur_s = dur_ns / Gst.SECOND
+        pos_s = max(0.0, (pos_ns if pos_ns >= 0 else 0) / Gst.SECOND)
+        frac = min(1.0, pos_s / dur_s) if dur_s > 0 else 0.0
+        if not self._seeking:
+            self.progress.set_value(frac)
+        self.time_start_lbl.set_text(self._fmt_hms(pos_s))
+        self.time_end_lbl.set_text(self._fmt_hms(dur_s))
+        remain = max(0.0, dur_s - pos_s)
+        self.time_remain_lbl.set_text(f"−{self._fmt_hms(remain)}")
+
+    def _on_progress_seek(self, _scale, _scroll, value: float) -> bool:
+        """Przeciaganie paska – seek w VOD (HTTP). Live ignorujemy."""
+        player = self.stream_ctrl.player
+        if not getattr(player, "is_http_mode", False):
+            return True
+        gi.require_version("Gst", "1.0")
+        from gi.repository import Gst
+
+        dur_ns = player.get_duration_ns()
+        if dur_ns <= 0:
+            return True
+        value = max(0.0, min(1.0, float(value)))
+        target = int(value * dur_ns)
+        player.seek_ns(target)
+        return True
+
+    def _on_progress_gesture_release(self, *_args) -> None:
+        self._seeking = False
+        # Natychmiast odswiez pozycje po puszczeniu
+        self._refresh_progress()
 
     def _ensure_progress_timer(self) -> None:
         if self._progress_source is not None:
@@ -794,12 +1005,88 @@ class LiveView(Gtk.Box):
         self.picture.set_paintable(paintable)
         # Wymuś widok wideo (placeholder "Brak odtwarzania" znika)
         self.video_stack.set_visible_child_name("video")
+        self._force_video_relayout()
+        # VOD: od razu wlacz timer paska (seekowalny)
+        if getattr(self.stream_ctrl.player, "is_http_mode", False):
+            self._ensure_progress_timer()
+
+    def _on_video_tick(self, _widget, _clock) -> bool:
+        """Wykrywa zmiane rozmiaru obszaru wideo i wymusza skalowanie."""
+        w = self.overlay.get_width()
+        h = self.overlay.get_height()
+        if w > 0 and h > 0 and (w, h) != self._video_area_size:
+            self._video_area_size = (w, h)
+            self._force_video_relayout()
+        return GLib.SOURCE_CONTINUE
+
+    def _force_video_relayout(self) -> None:
+        """Wymusza ponowne narysowanie wideo po zmianie rozmiaru okna.
+
+        gtk4paintablesink + Gtk.Picture czasem zostawiaja stary rozmiar
+        intrinsic po shrink/expand – queue_draw + invalidate pomaga.
+        W trybie cinema ContentFit.COVER wypelnia caly obszar."""
+        try:
+            paintable = self.picture.get_paintable()
+            if paintable is not None:
+                inv = getattr(paintable, "invalidate_contents", None)
+                if callable(inv):
+                    inv()
+                inv_size = getattr(paintable, "invalidate_size", None)
+                if callable(inv_size):
+                    inv_size()
+        except Exception:
+            pass
         self.picture.queue_draw()
         if self.video_widget is not self.picture:
             try:
                 self.video_widget.queue_draw()
             except Exception:
                 pass
+        self.overlay.queue_allocate()
+        self.overlay.queue_draw()
+
+    # ------------------------------------------------------------------ #
+    # Tryb kino (bez GUI) – klawisz F
+    # ------------------------------------------------------------------ #
+    def toggle_cinema_mode(self) -> None:
+        """Przelacza tryb ogladania bez GUI (OSD, lista kanalow, pasek HbbTV).
+
+        Dziala zarowno w TV mode jak i przy aktywnej warstwie HbbTV:
+        chowa host-UI, zostawia wideo (+ ewentualnie WebView HbbTV).
+        Ponowne F albo Escape wychodzi z trybu."""
+        self.set_cinema_mode(not self._cinema_mode)
+
+    def set_cinema_mode(self, enabled: bool) -> None:
+        self._cinema_mode = bool(enabled)
+        if self._cinema_mode:
+            self._hide_osd()
+            if self.channel_list_revealer is not None:
+                self.channel_list_revealer.set_reveal_child(False)
+            # Pasek HbbTV chowamy tylko wizualnie – apka nadal dziala;
+            # F1-F4 na klawiaturze dalej dispatchuja VK_*.
+            if hasattr(self, "hbbtv_bar"):
+                self.hbbtv_bar.set_visible(False)
+            # Wypelnij caly obszar (bez letterbox) w trybie kina
+            try:
+                self.picture.set_content_fit(Gtk.ContentFit.COVER)
+            except Exception:
+                pass
+            self._force_video_relayout()
+            logging.getLogger(__name__).info("Tryb kino WLACZONY (bez GUI)")
+        else:
+            if hasattr(self, "hbbtv_bar") and self.hbbtv.is_running:
+                self.hbbtv_bar.set_visible(True)
+            try:
+                self.picture.set_content_fit(Gtk.ContentFit.CONTAIN)
+            except Exception:
+                pass
+            self._force_video_relayout()
+            self._show_osd_temporarily()
+            logging.getLogger(__name__).info("Tryb kino WYLACZONY")
+
+    @property
+    def cinema_mode(self) -> bool:
+        return self._cinema_mode
 
     # Mapowanie stanu GstPlayer ("state-changed") na OIPF
     # video/broadcast.playState (0=unrealized 1=connecting 2=presenting
@@ -906,7 +1193,70 @@ class LiveView(Gtk.Box):
     # ------------------------------------------------------------------ #
     # OSD: półprzezroczysta nakładka, auto-hide 5 s
     # ------------------------------------------------------------------ #
+    def _hbbtv_owns_screen(self) -> bool:
+        """True gdy warstwa WebView aplikacji HbbTV jest aktualnie na
+        ekranie (uruchomiona I widoczna - hbbtv.hide() z toggle na
+        hbbtv_bar wraca False, bo wtedy widac juz tylko zwykle wideo).
+
+        W tym stanie zwykly, znikajacy OSD (top_osd/bottom_osd) NIE
+        powinien sie pokazywac: obie belki sa nakladkami Gtk.Overlay NAD
+        warstwa WebView (self.hbbtv.widget dodany do self.overlay PRZED
+        top_osd/bottom_osd - patrz __init__), wiec gdy staja sie
+        sensitive=True (_show_osd_temporarily), GTK4 zaczyna je znow
+        uwzgledniac przy "pick" (domyslnie pomija tylko widgety
+        sensitive=False) i przechwytuja klikniecie/tap w swoim pasie ekranu
+        (gora/dol) zamiast przepuszczac je do aplikacji ponizej - a to
+        WLASNIE tam wiele portali HbbTV (w tym testowy portal TVP) rysuje
+        wlasna nawigacje i podpowiedzi kolorowych przyciskow. Do tego
+        _show_osd_temporarily() jest wolane przy KAZDYM ruchu myszy/kliku w
+        calym self.overlay (patrz _on_motion/_on_click), wiec bez tego
+        gatingu OSD odpalalby sie na nowo za kazdym razem, gdy ktos probuje
+        cokolwiek kliknac w aplikacji.
+
+        Sterowanie aplikacja HbbTV (stop/mute/kolory/toggle/close) ma wlasny,
+        stale widoczny pasek self.hbbtv_bar POZA tym Overlayem (osobny
+        wiersz layoutu LiveView, nie kolejna nakladka) - patrz
+        _build_hbbtv_bar - wiec nic nie staje sie nieosiagalne."""
+        return self.hbbtv.is_running and self.hbbtv.is_visible
+
+    def _force_hide_osd(self) -> None:
+        """Natychmiastowe, twarde schowanie OSD (opacity + visible + sensitive).
+
+        Uzywane gdy HbbTV przejmuje ekran - sam opacity=0 bywa niewystarczajacy
+        (CSS shadow/background potrafi zostawic "smuge", a sensitive=False
+        bez visible=False nadal bierze udzial w hit-testach overlay)."""
+        if self._osd_hide_source:
+            GLib.source_remove(self._osd_hide_source)
+            self._osd_hide_source = None
+        self.top_osd.set_opacity(0)
+        self.bottom_osd.set_opacity(0)
+        self.top_osd.set_sensitive(False)
+        self.bottom_osd.set_sensitive(False)
+        self.top_osd.set_visible(False)
+        self.bottom_osd.set_visible(False)
+        try:
+            self.top_osd.set_can_target(False)
+            self.bottom_osd.set_can_target(False)
+        except Exception:
+            pass
+
     def _show_osd_temporarily(self) -> None:
+        if self._hbbtv_owns_screen():
+            # Zostawiamy OSD schowane; gdyby ktos wolal show podczas HbbTV
+            # (np. z innego callbacku), upewnij sie ze belki sa niewidoczne.
+            self._force_hide_osd()
+            return
+        # W trybie kino OSD pozostaje ukryte – wyjscie przez F / Escape
+        if self._cinema_mode:
+            return
+        # Przywroc widocznosc widgetow (mogły byc set_visible(False) po HbbTV)
+        self.top_osd.set_visible(True)
+        self.bottom_osd.set_visible(True)
+        try:
+            self.top_osd.set_can_target(True)
+            self.bottom_osd.set_can_target(True)
+        except Exception:
+            pass
         self.top_osd.set_opacity(1.0)
         self.bottom_osd.set_opacity(1.0)
         self.top_osd.set_sensitive(True)
@@ -919,11 +1269,18 @@ class LiveView(Gtk.Box):
         self._osd_hide_source = GLib.timeout_add(OSD_HIDE_DELAY_MS, self._hide_osd)
 
     def _hide_osd(self) -> bool:
+        # W trybie HbbTV zawsze twarde schowanie (visible=False)
+        if self._hbbtv_owns_screen():
+            self._force_hide_osd()
+            return False
         if self.video_stack.get_visible_child_name() == "video":
             self.top_osd.set_opacity(0)
             self.bottom_osd.set_opacity(0)
             self.top_osd.set_sensitive(False)
             self.bottom_osd.set_sensitive(False)
+            # Widgety zostaja visible=True (opacity 0) - tak dzialal
+            # dotychczasowy auto-hide OSD w trybie TV; motion/click
+            # nadal moga je odslonic przez _show_osd_temporarily.
         self._osd_hide_source = None
         return False
 
