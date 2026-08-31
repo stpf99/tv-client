@@ -107,6 +107,11 @@ class TvhLibrary(GObject.GObject):
         self._sync_event_count = 0
         self._sync_progress_scheduled = False
         self._initial_sync_done = False
+        # Czy mamy juz PEWNOSC, ze wszystkie kanaly/tagi dotarly - patrz
+        # _mark_channels_settled(). Dopoki False, _schedule_channels_changed()
+        # celowo nic nie planuje (patrz tam), zeby uniknac wielokrotnej
+        # przebudowy list kanalow w trakcie samego strumienia channelAdd.
+        self._channels_settled = False
         # Czy biezace dane w self.channels/events_by_channel pochodza
         # (jeszcze) tylko z cache dyskowego, a nie z serwera - do
         # ewentualnego pokazania w UI ("dane wstepne, ladowanie...").
@@ -151,6 +156,7 @@ class TvhLibrary(GObject.GObject):
         self.host, self.port, self.username = host, port, username
         self.http_port = http_port or 9981
         self.password = password or ""
+        self._channels_settled = False
 
         self._maybe_load_disk_cache(host, port)
 
@@ -218,15 +224,53 @@ class TvhLibrary(GObject.GObject):
     # Batching/debounce pomocnicze
     # ------------------------------------------------------------------ #
     def _schedule_channels_changed(self) -> None:
+        if not self._channels_settled:
+            # Wstepna synchronizacja jeszcze trwa (kanaly wciaz naplywaja
+            # pojedynczo przez channelAdd) - CELOWO nic tu nie planujemy.
+            # Dopoki nie przyjdzie pierwsza wiadomosc kolejnej fazy protokolu
+            # HTSP (dvrEntryAdd/eventAdd/initialSyncCompleted), nie mamy
+            # pewnosci ze lista kanalow jest kompletna - a przebudowa
+            # Gtk.ListBox na niepelnym, wciaz zmieniajacym sie zbiorze to
+            # dokladnie ten koszt (wielokrotne tworzenie wierszy + ich
+            # resortowanie w ChannelListView.reload()), ktorego unika
+            # pvr.hts czekajac na SyncChannelsCompleted() zamiast wypychac
+            # kanaly do UI Kodi jeden po drugim. Patrz _mark_channels_settled().
+            return
         if self._channels_emit_scheduled:
             return
         self._channels_emit_scheduled = True
         # 400ms (bylo 150ms): kazdy emit tego sygnalu wyzwala pelna
         # przebudowe listy kanalow w kazdym otwartym widoku (lista, EPG,
-        # siatka EPG) - podczas synchronizacji setek kanalow rzadszy
-        # debounce oznacza kilka przebudow zamiast kilkunastu, bez zadnej
-        # zauwazalnej roznicy w postrzeganej plynnosci startu.
+        # siatka EPG) - to juz tylko zywe aktualizacje PO wstepnej
+        # synchronizacji (kanal dodany/usuniety/zmieniony w trakcie
+        # dzialania), gdzie rzadszy debounce nadal ma sens przy kilku
+        # zmianach naraz.
         GLib.timeout_add(400, self._flush_channels_changed)
+
+    def _mark_channels_settled(self) -> None:
+        """Wywolywane przy pierwszej wiadomosci nastepnej fazy synchronizacji
+        HTSP (dvrEntryAdd - patrz _on_dvr_add; eventAdd - patrz _on_event_add;
+        initialSyncCompleted - patrz _on_initial_sync). Tvheadend gwarantuje
+        kolejnosc wysylki: tagi -> kanaly -> DVR/autorec/timerec -> EPG ->
+        initialSyncCompleted, wiec przyjscie PIERWSZEJ wiadomosci
+        ktoregokolwiek z tych kolejnych typow jest dowodem, ze WSZYSTKIE
+        kanaly i tagi juz dotarly - dokladnie tak jak pvr.hts wnioskuje
+        "kanaly kompletne" z przyjscia pierwszego dvrEntryAdd (patrz
+        SyncChannelsCompleted() w Tvheadend.cpp), bez czekania na koniec
+        calej synchronizacji (ktora dla EPG bywa wielokrotnie dluzsza).
+
+        Odpalamy teraz JEDEN zbiorczy rebuild UI (patrz
+        _schedule_channels_changed powyzej, ktora do tego momentu nic nie
+        planowala) zamiast pozwalac na dalsze przebudowy co ~400ms przez
+        reszte trwania synchronizacji.
+        """
+        if self._channels_settled:
+            return
+        self._channels_settled = True
+        if self._channels_emit_scheduled:
+            return
+        self._channels_emit_scheduled = True
+        GLib.idle_add(self._flush_channels_changed)
 
     def _flush_channels_changed(self) -> bool:
         self._channels_emit_scheduled = False
@@ -284,6 +328,11 @@ class TvhLibrary(GObject.GObject):
             self._schedule_channels_changed()
 
     def _on_event_add(self, m: dict) -> None:
+        # Jak w _on_dvr_add - eventAdd tez zawsze przychodzi PO kanalach (i
+        # ew. DVR/autorec/timerec), wiec to rowniez pewny sygnal "kanaly
+        # kompletne" - potrzebny na serwerach bez zadnych wpisow DVR, gdzie
+        # dvrEntryAdd nigdy nie nadejdzie.
+        self._mark_channels_settled()
         ev = EpgEvent.from_htsp(m)
         self.events[ev.event_id] = ev
         ch_id = ev.channel_id
@@ -346,6 +395,9 @@ class TvhLibrary(GObject.GObject):
         self._schedule_sync_progress()
 
     def _on_dvr_add(self, m: dict) -> None:
+        # Wg gwarancji kolejnosci HTSP ta wiadomosc zawsze przychodzi PO
+        # wszystkich kanalach/tagach - patrz _mark_channels_settled().
+        self._mark_channels_settled()
         rec = Recording.from_htsp(m)
         self.recordings[rec.entry_id] = rec
         self.emit("recordings-changed")
@@ -435,6 +487,10 @@ class TvhLibrary(GObject.GObject):
         ).start()
 
     def _on_initial_sync(self) -> None:
+        # Ostateczny fallback (patrz _mark_channels_settled) - na wypadek
+        # serwera bez zadnych wpisow DVR i z epg=False, gdzie zadna z
+        # wczesniejszych okazji (_on_dvr_add/_on_event_add) nie wystapila.
+        self._mark_channels_settled()
         self._initial_sync_done = True
         self.showing_cached_data = False
         # finalny, pelny rebuild widokow po zakonczeniu synchronizacji
